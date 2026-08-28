@@ -71,9 +71,11 @@ function UpgradeContext(
 // Duplex stream methods — called with `this` = tlsSocket (standard stream API)
 // ---------------------------------------------------------------------------
 
-// _read: called by stream machinery when the H2 session wants data.
-// Resume the native TLS handle so it feeds decrypted data via the data callback.
-// Mirrors net.ts Socket.prototype._read which calls socket.resume().
+// _read: called by stream machinery when the H2 session wants data. Undoes
+// socketData's backpressure: resuming the native TLS handle resumes the raw
+// socket's reads when it is a net.Socket (read natively); rawSocket.resume()
+// covers a JS Duplex fed through 'data' events. Mirrors net.ts
+// Socket.prototype._read which calls socket.resume().
 function tlsSocketRead(this: TLSProxySocket) {
   const h = this._ctx.nativeHandle;
   if (h) {
@@ -139,11 +141,13 @@ function tlsSocketFinal(this: TLSProxySocket, callback: () => void) {
 function socketOpen() {}
 
 // data: called with decrypted plaintext after the TLS layer decrypts incoming data.
-// Push into tlsSocket so the H2 session's _read() receives these frames.
+// Push into tlsSocket so the H2 session's _read() receives these frames. When
+// the session is not keeping up, stop reading: a net.Socket rawSocket is read
+// natively below its stream, so only pausing the TLS handle (which pauses that
+// socket's fd) stops it; rawSocket.pause() covers a JS Duplex fed via 'data'.
 function socketData(this: TLSProxySocket, socket: NativeHandle, chunk: Buffer) {
   this._ctx.rawSocket._unrefTimer?.();
   if (!this.push(chunk)) {
-    // A handle-backed raw socket is read below its stream: pause the handle.
     socket.pause();
     this._ctx.rawSocket.pause();
   }
