@@ -3365,14 +3365,15 @@ impl<const SSL: bool> NewSocket<SSL> {
         Self::upgrade_tls_impl(this, global, opts, false)
     }
 
-    /// `defers_server_identity`: node:tls owns hostname policy in its JS layer
-    /// (`checkServerIdentity`), so its internal entry point sets it; the public
-    /// `upgradeTLS` never does.
+    /// `for_node_net`: node:tls owns hostname policy in its JS layer
+    /// (`checkServerIdentity`), and its wrapped `net.Socket` goes quiet the way
+    /// node's `_parentWrap` does — `raw` keeps the fd for close/destroy but is
+    /// not shown the ciphertext. The public `upgradeTLS` does neither.
     fn upgrade_tls_impl(
         this: &Self,
         global: &JSGlobalObject,
         opts: JSValue,
-        defers_server_identity: bool,
+        for_node_net: bool,
     ) -> JsResult<JSValue> {
         if SSL {
             return Ok(JSValue::UNDEFINED);
@@ -3533,7 +3534,7 @@ impl<const SSL: bool> NewSocket<SSL> {
             ),
         };
         let mut initial_flags = Flags::initial(reject_unauthorized);
-        initial_flags.set(Flags::DEFERS_SERVER_IDENTITY, defers_server_identity);
+        initial_flags.set(Flags::DEFERS_SERVER_IDENTITY, for_node_net);
         initial_flags.set(Flags::TLS_SERVER_ROLE, is_server);
         let tls: bun_ptr::ThisPtr<TLSSocket> = TLSSocket::new(TLSSocket {
             ref_count: bun_ptr::RefCount::init(),
@@ -3635,8 +3636,9 @@ impl<const SSL: bool> NewSocket<SSL> {
         tls.ref_();
 
         // The `raw` half — same `us_socket_t*`, ORIGINAL pre-upgrade
-        // *Handlers, writes bypass SSL. Dispatch reaches it via the
-        // `ssl_raw_tap` ciphertext hook, never via the ext slot.
+        // *Handlers, writes bypass SSL. Never in the ext slot: it gets
+        // close/end chained from `tls`, and data only via `ssl_raw_tap`
+        // (public `upgradeTLS` only).
         let raw = TLSSocket::new(TLSSocket {
             ref_count: bun_ptr::RefCount::init(),
             handlers: JsCell::new(raw_handlers),
@@ -3707,10 +3709,11 @@ impl<const SSL: bool> NewSocket<SSL> {
         if !initial_data.is_empty() {
             bun_opaque::opaque_deref_mut(new_raw.as_ptr()).tls_feed(initial_data.as_slice());
         }
-        // `raw` sees the ciphertext from here on. Not before: `initial_data`
-        // already went through these handlers once, on its way in. (Wire bytes
-        // only arrive from the event loop, so nothing was missed since `resume()`.)
-        bun_opaque::opaque_deref_mut(new_raw.as_ptr()).set_ssl_raw_tap(true);
+        // After `initial_data`: those bytes already went through `raw`'s
+        // handlers once on their way in.
+        if !for_node_net {
+            bun_opaque::opaque_deref_mut(new_raw.as_ptr()).set_ssl_raw_tap(true);
+        }
 
         let array = JSValue::create_empty_array(global, 2)?;
         array.put_index(global, 0, raw_js_value)?;
@@ -4533,10 +4536,10 @@ impl DuplexUpgradeContext {
 // Free-standing host functions
 // ──────────────────────────────────────────────────────────────────────────
 
-/// node:tls's `tls.connect({ socket })` entry point: same upgrade as the
-/// public `upgradeTLS`, but hostname policy stays with node's JS layer.
+/// node:tls's `tls.connect({ socket })` / `new TLSSocket(socket)` entry
+/// point: see `for_node_net` on `upgrade_tls_impl`.
 #[bun_jsc::host_fn]
-pub fn js_upgrade_tls_deferred(
+pub fn js_node_net_upgrade_tls(
     global: &JSGlobalObject,
     callframe: &CallFrame,
 ) -> JsResult<JSValue> {

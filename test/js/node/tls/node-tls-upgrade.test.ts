@@ -326,17 +326,20 @@ test.concurrent.each([
 });
 
 test.concurrent(
-  "new TLSSocket(accepted, { isServer: true }) does not put an already buffered ClientHello back",
+  "new TLSSocket(accepted, { isServer: true }) hands an already buffered ClientHello over once",
   async () => {
     // Paused-mode STARTTLS: the ClientHello that PROCEED triggers is sitting in
     // the accepted socket's readable buffer when the wrap runs, so the wrap has
-    // to take it from there. Pre-fix it was handed to TLS and also delivered to
-    // the accepted socket a second time: pushed back into its buffer and counted
-    // in bytesRead again. bytesRead has to keep matching what actually came in
-    // over the wire (node's wrapped socket keeps counting), which a relay in
-    // front of the server measures.
+    // to take it from there. Like node's initRead that hand-over read()s the
+    // buffer, so a `data` listener attached by then sees those bytes once — and
+    // nothing after them (pre-fix they were also pushed back into the buffer, and
+    // the rest of the session followed).
     const { promise: failure, reject } = Promise.withResolvers<never>();
-    const { promise: accountedOnServer, resolve } = Promise.withResolvers<{ buffered: number; bytesRead: number }>();
+    const { promise: serverSide, resolve } = Promise.withResolvers<{
+      handedOver: number;
+      emitted: number;
+      buffered: number;
+    }>();
     using server = await listenTCP(accepted => {
       accepted.on("error", reject);
       accepted.once("data", command => {
@@ -347,28 +350,16 @@ test.concurrent(
         accepted.pause();
         accepted.write("PROCEED");
         accepted.once("readable", () => {
+          const handedOver = accepted.readableLength;
           const secure = new tls.TLSSocket(accepted, { isServer: true, ...serverTLS });
           secure.on("error", reject);
-          // By the time application data is decrypted, everything the client
-          // ever sent has been read off the wire.
-          secure.once("data", () => resolve({ buffered: accepted.readableLength, bytesRead: accepted.bytesRead }));
+          const surfaced = watchSurfacing(accepted);
+          secure.once("data", () => resolve({ handedOver, ...surfaced() }));
         });
       });
     });
-    let wireBytesToServer = 0;
-    using relay = await listenTCP(fromClient => {
-      const toServer = net.connect(server.port, "127.0.0.1");
-      fromClient.on("error", reject);
-      toServer.on("error", reject);
-      fromClient.on("data", chunk => {
-        wireBytesToServer += chunk.length;
-        toServer.write(chunk);
-      });
-      toServer.pipe(fromClient);
-      fromClient.on("close", () => toServer.destroy());
-    });
 
-    const socket = net.connect(relay.port, "127.0.0.1");
+    const socket = net.connect(server.port, "127.0.0.1");
     try {
       socket.on("error", reject);
       await Promise.race([once(socket, "connect"), failure]);
@@ -378,8 +369,9 @@ test.concurrent(
       const tlsSocket = tls.connect({ socket, ...clientTLS });
       tlsSocket.on("error", reject);
       tlsSocket.on("secureConnect", () => tlsSocket.write("ping"));
-      const accounted = await Promise.race([accountedOnServer, failure]);
-      expect(accounted).toEqual({ buffered: 0, bytesRead: wireBytesToServer });
+      const result = await Promise.race([serverSide, failure]);
+      expect(result.handedOver).toBeGreaterThan(0);
+      expect(result).toEqual({ handedOver: result.handedOver, emitted: result.handedOver, buffered: 0 });
     } finally {
       socket.destroy();
     }
@@ -516,5 +508,43 @@ test.concurrent("a socket whose TLS session is over can reconnect as a plain soc
   } finally {
     socket.destroy();
     secureServer.close();
+  }
+});
+
+test.concurrent("TLS traffic keeps the wrapped socket's idle timeout alive, as in node", async () => {
+  // Node links the TLSSocket to the net.Socket it wraps (`_parent`) and
+  // refreshes both idle timers on activity; the wrapped socket itself no
+  // longer sees any bytes, so without that link it times out mid-session no
+  // matter how busy the TLS layer is.
+  const IDLE = 1000;
+  const { promise: failure, reject } = Promise.withResolvers<never>();
+  using server = await listenTCP(accepted => wrapAndEcho(accepted, reject));
+  const socket = net.connect(server.port, "127.0.0.1");
+  try {
+    socket.on("error", reject);
+    await Promise.race([once(socket, "connect"), failure]);
+    const tlsSocket = tls.connect({ socket, ...clientTLS });
+    tlsSocket.on("error", reject);
+    expect(tlsSocket._parent).toBe(socket);
+    await Promise.race([once(tlsSocket, "secureConnect"), failure]);
+    let parentTimedOut = false;
+    socket.setTimeout(IDLE, () => (parentTimedOut = true));
+    // Back-to-back ping/echo round trips (each far shorter than IDLE) until
+    // well past IDLE since the timer was armed.
+    const started = Date.now();
+    tlsSocket.write("ping");
+    await Promise.race([
+      new Promise<void>(resolve => {
+        tlsSocket.on("data", () => {
+          if (Date.now() - started > IDLE * 2.5) resolve();
+          else tlsSocket.write("ping");
+        });
+      }),
+      failure,
+    ]);
+    expect(parentTimedOut).toBe(false);
+  } finally {
+    socket.setTimeout(0);
+    socket.destroy();
   }
 });
