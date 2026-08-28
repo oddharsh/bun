@@ -1692,6 +1692,7 @@ void us_internal_ssl_attach(struct us_socket_t *s, SSL_CTX *ctx,
   s->ssl_read_wants_write = 0;
   s->ssl_fatal_error = 0;
   s->ssl_raw_tap = 0;
+  s->ssl_handshake_held = 0;
   s->ssl_shutdown_after_spill = 0;
   s->ssl_close_after_spill = 0;
   s->ssl_end_delivered = 0;
@@ -2043,6 +2044,15 @@ struct us_socket_t *us_internal_ssl_close(struct us_socket_t *s, int code, void 
   if (ssl_gone(s) || (us_internal_poll_type(&s->p) & POLL_TYPE_KIND_MASK) == POLL_TYPE_SEMI_SOCKET) {
     return us_internal_socket_close_raw(s, code, reason);
   }
+  /* A held handshake never started: nothing of TLS goes on the wire, but the
+   * owner hears about it like any other close before the handshake finished. */
+  if (s->ssl_handshake_held) {
+    if (s->ssl_handshake_state != HANDSHAKE_COMPLETED) {
+      ssl_trigger_handshake_econnreset(s);
+      if (ssl_gone(s) || us_socket_is_closed(s)) return s;
+    }
+    return us_internal_socket_close_raw(s, code, reason);
+  }
   ssl_set_loop_data(s);
   ssl_update_handshake(s);
   if (ssl_gone(s)) return s;
@@ -2082,7 +2092,7 @@ static void ssl_update_handshake(struct us_socket_t *s) {
    * it; clear it before this socket's handshake step so any reason captured
    * below genuinely belongs to this socket's own failure. */
   ERR_clear_error();
-    if (!s->ssl || s->ssl_handshake_state != HANDSHAKE_PENDING) return;
+    if (!s->ssl || s->ssl_handshake_state != HANDSHAKE_PENDING || s->ssl_handshake_held) return;
 
   /* SSL_read may have driven the handshake to completion before we got here
    * (TLS 1.3 server: client's Finished + close_notify in one segment lands as
@@ -2275,6 +2285,9 @@ struct us_socket_t *us_internal_ssl_on_end(struct us_socket_t *s) {
 }
 
 struct us_socket_t *us_internal_ssl_on_writable(struct us_socket_t *s) {
+  /* Nothing of TLS is in flight yet; the event is for the previous owner's
+   * plaintext (see ssl_handshake_held). */
+  if (s->ssl_handshake_held) return us_dispatch_writable(s);
   ssl_set_loop_data(s);
   {
     struct loop_ssl_data *loop_ssl_data = (struct loop_ssl_data *)s->group->loop->data.ssl_data;
@@ -2338,6 +2351,8 @@ struct us_socket_t *us_internal_ssl_on_writable(struct us_socket_t *s) {
 }
 
 struct us_socket_t *us_internal_ssl_on_data(struct us_socket_t *s, char *data, int length) {
+  /* Not TLS's yet: the owner keeps it for us_socket_start_tls_handshake. */
+  if (s->ssl_handshake_held) return us_dispatch_data(s, data, length);
   /* See ssl_update_handshake: start this socket's SSL processing with a clean
    * per-thread error queue so a captured reason cannot belong to another
    * socket on the same thread. */
@@ -2617,7 +2632,8 @@ restart:
  * and the expensive crypto work is the first step, so deprioritising
  * mid-handshake sockets keeps fully-established ones responsive under load. */
 int us_internal_ssl_is_low_prio(struct us_socket_t *s) {
-  return SSL_in_init(s_ssl(s));
+  /* The handshake budget is for handshakes; a held socket is still plaintext. */
+  return !s->ssl_handshake_held && SSL_in_init(s_ssl(s));
 }
 
 /* ── Socket-level accessors / write / shutdown ───────────────────────────── */
@@ -2667,8 +2683,9 @@ int us_internal_ssl_write(struct us_socket_t *s, const char *data, int length) {
   }
 
   /* Called from inside SSL_read/SSL_do_handshake on this socket (an ALPN/SNI
-   * callback writing): wait for the handshake, same as WANT_READ below. */
-  if (s->ssl_in_use) {
+   * callback writing), or the handshake is held behind the previous owner's
+   * plaintext: wait for the handshake, same as WANT_READ below. */
+  if (s->ssl_in_use || s->ssl_handshake_held) {
     s->ssl_write_wants_read = 1;
     return 0;
   }
@@ -2749,6 +2766,11 @@ int us_internal_ssl_write(struct us_socket_t *s, const char *data, int length) {
 
 void us_internal_ssl_shutdown(struct us_socket_t *s) {
   if (us_socket_is_closed(s) || us_internal_ssl_is_shut_down(s)) return;
+  if (s->ssl_handshake_held) {
+    /* TLS never started: a plain FIN, no close_notify. */
+    us_internal_socket_raw_shutdown(s);
+    return;
+  }
 
   /* Spilled ciphertext is data the layers above already count as written;
    * a FIN/close_notify now would cut it off. Finish the shutdown from the
@@ -2892,8 +2914,14 @@ struct us_socket_t *us_socket_adopt_tls(struct us_socket_t *s,
   return new_s;
 }
 
+void us_socket_hold_tls_handshake(struct us_socket_t *s) {
+  if (!s->ssl || us_socket_is_closed(s)) return;
+  s->ssl_handshake_held = 1;
+}
+
 void us_socket_start_tls_handshake(struct us_socket_t *s) {
   if (!s->ssl || us_socket_is_closed(s)) return;
+  s->ssl_handshake_held = 0;
   ssl_set_loop_data(s);
   ssl_update_handshake(s);
 }

@@ -303,8 +303,8 @@ pub struct NewSocket<const SSL: bool> {
     pub(crate) flags: Cell<Flags>,
     pub(crate) ref_count: bun_ptr::RefCount<Self>,
     /// The callbacks this socket dispatches to: shared with its listener and
-    /// sibling sockets (server), or with its own reconnects and TLS twin
-    /// (client). `None` once the socket has gone idle or been detached, which
+    /// sibling sockets (server), or with its own reconnects (client). `None`
+    /// once the socket has gone idle or been detached, which
     /// every dispatch entry point treats as "nothing left to call".
     ///
     /// `Rc`, not a raw pointer: JS dispatch is reentrant (a `close` handler can
@@ -325,15 +325,16 @@ pub struct NewSocket<const SSL: bool> {
     pub(crate) protos: JsCell<Option<Box<[u8]>>>,
     pub(crate) server_name: JsCell<Option<Box<[u8]>>>,
     pub(crate) buffered_data_for_node_net: JsCell<Vec<u8>>,
+    /// Ciphertext that arrived while `HANDSHAKE_HELD`; fed at `startTLSHandshake`.
+    pub(crate) held_input: JsCell<Vec<u8>>,
     pub(crate) bytes_written: Cell<u64>,
 
     pub(crate) native_callback: JsCell<NativeCallbacks>,
-    /// `upgradeTLS` produces two `TLSSocket` wrappers over one
-    /// `us_socket_t` (the encrypted view + the raw-bytes view node:net
-    /// expects at index 0). The encrypted half holds a ref on the raw half
-    /// here so a single `onClose` can retire both — no `Handlers.clone()`,
-    /// no second context.
-    pub(crate) twin: JsCell<Option<RefPtr<Self>>>,
+    /// After `upgradeTLS`, the encrypted half's ref on the original socket —
+    /// now the `raw` half over the same `us_socket_t` (index 0 of `[raw, tls]`,
+    /// node:net's `_parent` handle). It is never in the ext slot, so close and
+    /// writable are chained to it from here. Unused on a `TCPSocket`.
+    pub(crate) twin: JsCell<Option<RefPtr<TCPSocket>>>,
     /// Owned copy of the handshake verify error, so `getAuthorizationError()`
     /// keeps its verdict after detach (the live error borrows the `SSL`, and
     /// EPROTO reasons are stack-copied in uSockets).
@@ -549,15 +550,12 @@ impl<const SSL: bool> NewSocket<SSL> {
     pub(crate) fn memory_cost(&self) -> usize {
         // Per-socket SSL state (SSL*, BIO pair, handshake buffers) is ~40 KB
         // off-heap. Reporting it lets the GC apply pressure when JS churns
-        // through short-lived TLS connections. The raw `[raw, tls]` upgrade
-        // twin shares the same SSL* — only the encrypted half reports it.
-        let ssl_cost: usize = if SSL && !self.flags.get().contains(Flags::BYPASS_TLS) {
-            40 * 1024
-        } else {
-            0
-        };
+        // through short-lived TLS connections. (The `raw` half of an upgrade
+        // is a TCPSocket, so the shared SSL* is counted once.)
+        let ssl_cost: usize = if SSL { 40 * 1024 } else { 0 };
         core::mem::size_of::<Self>()
             + self.buffered_data_for_node_net.get().capacity() as usize
+            + self.held_input.get().capacity() as usize
             + ssl_cost
     }
 
@@ -570,10 +568,16 @@ impl<const SSL: bool> NewSocket<SSL> {
         true
     }
 
+    /// This socket is going away under whatever consumed it natively.
     pub(crate) fn detach_native_callback(&self) {
-        if let NativeCallbacks::H2(h2) = self.native_callback.replace(NativeCallbacks::None) {
-            h2.on_native_close();
-        }
+        self.native_callback
+            .replace(NativeCallbacks::None)
+            .on_close();
+    }
+
+    /// The native consumer is done with this socket (nothing to notify).
+    pub(crate) fn clear_native_callback(&self) {
+        self.native_callback.set(NativeCallbacks::None);
     }
 
     /// Connect to `self.connection` (must be `Some`). Reads the field directly
@@ -714,11 +718,7 @@ impl<const SSL: bool> NewSocket<SSL> {
         // The raw half of an upgradeTLS pair is an observation tap; flow
         // control belongs to the TLS half. Pausing the shared fd here would
         // wedge the TLS read path (#15438).
-        if this
-            .flags
-            .get()
-            .intersects(Flags::BYPASS_TLS | Flags::READS_HELD_FOR_UPGRADE)
-        {
+        if this.flags.get().contains(Flags::BYPASS_TLS) {
             return Ok(JSValue::UNDEFINED);
         }
         this.resume_reads();
@@ -726,23 +726,51 @@ impl<const SSL: bool> NewSocket<SSL> {
     }
 
     pub(crate) fn resume_reads(&self) {
+        // `held_input` is full: reads come back with `startTLSHandshake`.
+        if self.flags.get().contains(Flags::HELD_INPUT_FULL) {
+            return;
+        }
         if self.flags.get().contains(Flags::IS_PAUSED) {
             let resumed = self.socket.get().resume_stream();
             self.update_flags(|f| f.set(Flags::IS_PAUSED, !resumed));
         }
     }
 
-    /// See `Flags::READS_HELD_FOR_UPGRADE`. The hold ends with this wrapper:
-    /// the upgrade retires it, an aborted upgrade destroys it.
+    /// A plain socket whose fd a TLS layer has taken over (`upgradeTLS`'s
+    /// `raw` half): it closes with that layer rather than on its own.
+    #[bun_jsc::host_fn(getter)]
+    pub(crate) fn get_fd_is_tls(this: &Self, _global: &JSGlobalObject) -> JsResult<JSValue> {
+        Ok(JSValue::from(this.flags.get().contains(Flags::BYPASS_TLS)))
+    }
+
+    /// See `Flags::HANDSHAKE_HELD`. `initialData`: what the previous owner had
+    /// already read off the wire (a ClientHello), fed as if it just arrived.
     #[bun_jsc::host_fn(method)]
-    pub(crate) fn hold_reads_for_upgrade(
+    pub(crate) fn start_tls_handshake(
         this: &Self,
-        _global: &JSGlobalObject,
-        _frame: &CallFrame,
+        global: &JSGlobalObject,
+        frame: &CallFrame,
     ) -> JsResult<JSValue> {
-        if !this.socket.get().is_detached() {
-            this.pause_reads();
-            this.update_flags(|f| f.insert(Flags::READS_HELD_FOR_UPGRADE));
+        let initial_data = bytes_from_js(global, frame.argument(0))?;
+        if !this.flags.get().contains(Flags::HANDSHAKE_HELD) {
+            return Ok(JSValue::UNDEFINED);
+        }
+        this.update_flags(|f| f.remove(Flags::HANDSHAKE_HELD));
+        let uws::InternalSocket::Connected(s) = this.socket.get().socket else {
+            return Ok(JSValue::UNDEFINED);
+        };
+        let held = this.held_input.replace(Vec::new());
+        if this.flags.get().contains(Flags::HELD_INPUT_FULL) {
+            this.update_flags(|f| f.remove(Flags::HELD_INPUT_FULL));
+            this.resume_reads();
+        }
+        let _keep = this.ref_guard();
+        // S008: `us_socket_t` is an `opaque_ffi!` ZST — safe deref.
+        bun_opaque::opaque_deref_mut(s).start_tls_handshake();
+        for early in [&initial_data, &held] {
+            if !early.is_empty() && !this.socket.get().is_detached() {
+                bun_opaque::opaque_deref_mut(s).tls_feed(early);
+            }
         }
         Ok(JSValue::UNDEFINED)
     }
@@ -953,6 +981,25 @@ impl<const SSL: bool> NewSocket<SSL> {
         if this.socket.get().is_detached() {
             return Ok(());
         }
+        // The `raw` half shares this fd and never gets its own dispatch;
+        // plaintext node:net had queued on it before the upgrade drains first.
+        if let Some(raw) = this
+            .twin
+            .get()
+            .as_ref()
+            .filter(|_| SSL)
+            .map(|t| t.this_ptr())
+        {
+            if raw.flags.get().contains(Flags::BYPASS_TLS)
+                && !raw.buffered_data_for_node_net.get().is_empty()
+            {
+                let _guard = RefPtr::from_this(this);
+                TCPSocket::on_writable(raw, SocketHandler::<false>::from_any(_socket.socket))?;
+                if this.socket.get().is_detached() {
+                    return Ok(());
+                }
+            }
+        }
         if this.native_callback.get().on_writable() {
             return Ok(());
         }
@@ -1079,8 +1126,8 @@ impl<const SSL: bool> NewSocket<SSL> {
     /// point checks [`has_handlers`](Self::has_handlers) first.
     ///
     /// Returns a fresh `Rc`, so JS re-entrancy from the caller (a `close`
-    /// handler that reconnects, an `upgradeTLS` that transfers the handlers to
-    /// a twin) cannot free the callbacks the caller is still reading.
+    /// handler that reconnects) cannot free the callbacks the caller is still
+    /// reading.
     pub(crate) fn get_handlers(&self) -> Rc<Handlers> {
         self.handlers_opt().expect("No handlers set on Socket")
     }
@@ -1100,11 +1147,6 @@ impl<const SSL: bool> NewSocket<SSL> {
     #[inline]
     fn handlers_are(&self, handlers: &Rc<Handlers>) -> bool {
         matches!(self.handlers.get(), Some(h) if Rc::ptr_eq(h, handlers))
-    }
-
-    #[inline]
-    fn take_handlers(&self) -> Option<Rc<Handlers>> {
-        self.handlers.with_mut(|h| h.take())
     }
 
     /// The event-loop exit drains microtasks, during which a synchronous
@@ -1369,16 +1411,33 @@ impl<const SSL: bool> NewSocket<SSL> {
     /// `debug_assert!` to catch.
     pub(crate) fn detach_for_reconnect(&self) {
         let old = self.socket.get();
-        let Some(ext) = old.ext::<*mut c_void>() else {
-            return;
-        };
-        // SAFETY: ext slot is sized for `*mut c_void`; single-threaded.
-        unsafe { *ext = core::ptr::null_mut() };
+        // The `raw` half of an upgrade owns neither the ext slot nor the fd
+        // (node:net refuses to reconnect such a socket; this is the backstop):
+        // it just stops being that half. The TLS half's `twin` chain skips a
+        // socket without BYPASS_TLS.
+        let raw_half = self.flags.get().contains(Flags::BYPASS_TLS);
+        if raw_half {
+            self.update_flags(|f| f.remove(Flags::BYPASS_TLS));
+        } else {
+            let Some(ext) = old.ext::<*mut c_void>() else {
+                return;
+            };
+            // SAFETY: ext slot is sized for `*mut c_void`; single-threaded.
+            unsafe { *ext = core::ptr::null_mut() };
+        }
         self.socket.set(SocketHandler::<SSL>::DETACHED);
         self.buffered_data_for_node_net
             .with_mut(|b| b.clear_and_free());
-        self.detach_native_callback();
-        old.close(uws::CloseCode::Failure);
+        // A stream-level TLS engine over this socket is simply cut off (its
+        // close_notify has nowhere sensible to go).
+        if matches!(self.native_callback.get(), NativeCallbacks::TlsTransport(_)) {
+            self.clear_native_callback();
+        } else {
+            self.detach_native_callback();
+        }
+        if !raw_half {
+            old.close(uws::CloseCode::Failure);
+        }
         self.poll_ref.with_mut(|p| p.unref(js_loop_ctx()));
         if self.flags.get().contains(Flags::IS_ACTIVE) {
             self.update_flags(|f| f.remove(Flags::IS_ACTIVE));
@@ -1715,6 +1774,13 @@ impl<const SSL: bool> NewSocket<SSL> {
         if this.socket.get().is_detached() {
             return Ok(());
         }
+        if this.native_callback.get().on_end() {
+            return Ok(());
+        }
+        // (That may have run JS that closed this socket.)
+        if !this.has_handlers() || this.socket.get().is_detached() {
+            return Ok(());
+        }
         let handlers = this.get_handlers();
         log!(
             "onEnd {}",
@@ -1854,20 +1920,25 @@ impl<const SSL: bool> NewSocket<SSL> {
         // verdict: protocol error, peer alert, EOF mid-handshake) never has a
         // usable transport either — node destroys the underlying socket before
         // user code can write again. Cover that flavor too, so the shared-fd
-        // twin of an `upgradeTLS` pair cannot push plaintext through its
+        // raw half of an `upgradeTLS` pair cannot push plaintext through its
         // BYPASS_TLS write path in the window before JS tears the pair down.
         let transport_unusable = reject_unauthorized || (SSL && success == 0);
 
         // `REJECTED` is set before the callback runs so no write path can
         // deliver application data to a peer that is about to be rejected —
-        // including the raw twin of an `upgradeTLS` pair, which shares the fd.
+        // including the raw half of an `upgradeTLS` pair, which shares the fd.
         this.update_flags(|f| {
             f.set(Flags::AUTHORIZED, authorized && !verify_failed);
             f.set(Flags::HOSTNAME_MISMATCH, hostname_mismatch);
             f.set(Flags::REJECTED, transport_unusable);
         });
         if transport_unusable {
-            if let Some(twin) = this.twin.get().as_ref() {
+            if let Some(twin) = this
+                .twin
+                .get()
+                .as_ref()
+                .filter(|t| t.flags.get().contains(Flags::BYPASS_TLS))
+            {
                 twin.update_flags(|f| f.insert(Flags::REJECTED));
             }
         } else if SSL {
@@ -2113,6 +2184,32 @@ impl<const SSL: bool> NewSocket<SSL> {
         err: c_int,
         reason: Option<*mut c_void>,
     ) -> JsResult<()> {
+        // The upgradeTLS `raw` half shares this us_socket_t and never gets its
+        // own dispatch; it hears about the close after the TLS half has (node:
+        // the TLS layer sees the EOF/error first, then its parent goes down).
+        let raw = this
+            .twin
+            .with_mut(|t| t.take())
+            .filter(|r| r.flags.get().contains(Flags::BYPASS_TLS));
+        // The fd is gone for it too; whatever the TLS half's close handler does
+        // with it meanwhile (end(), write()) is a no-op, as before the upgrade
+        // split them.
+        if let Some(raw) = raw.as_ref() {
+            raw.socket.set(SocketHandler::<false>::DETACHED);
+        }
+        let result = Self::on_close_impl(this, err);
+        if let Some(raw) = raw {
+            crate::dispatch::fold(TCPSocket::on_close(
+                raw.this_ptr(),
+                SocketHandler::<false>::from_any(socket.socket),
+                err,
+                reason,
+            ));
+        }
+        result
+    }
+
+    fn on_close_impl(this: bun_ptr::ThisPtr<Self>, err: c_int) -> JsResult<()> {
         jsc::mark_binding!();
         // A late close on a socket that already released its Handlers through
         // a path that did not route back through this dispatch - e.g. a
@@ -2138,18 +2235,6 @@ impl<const SSL: bool> NewSocket<SSL> {
         );
         this.detach_native_callback();
         this.socket.set(SocketHandler::<SSL>::DETACHED);
-        // The upgradeTLS raw twin shares the same us_socket_t so it never
-        // gets its own dispatch — fire its (pre-upgrade) close handler
-        // here, then retire it. `raw.twin == None` so this doesn't
-        // recurse, and `onClose` derefs the +1 we took at creation.
-        if let Some(raw) = this.twin.with_mut(|t| t.take()) {
-            // `on_close` consumes the twin's +1 via its `CloseTeardown`, so
-            // hand over the raw pointer rather than letting `RefPtr::drop`
-            // release it a second time. This frame is the twin's trampoline for
-            // the event, so what its handlers left pending is folded here and
-            // this socket's own close proceeds regardless.
-            crate::dispatch::fold(Self::on_close(raw.into_this_ptr(), socket, err, reason));
-        }
         let cleanup = CloseTeardown {
             socket: this,
             entered: Rc::clone(&handlers),
@@ -2224,6 +2309,17 @@ impl<const SSL: bool> NewSocket<SSL> {
         }
         this.socket.set(s);
         if this.socket.get().is_detached() {
+            return Ok(());
+        }
+        if SSL && this.flags.get().contains(Flags::HANDSHAKE_HELD) {
+            // Nothing legitimate is large here (at most a ClientHello); past the
+            // cap the rest waits in the kernel.
+            const HELD_INPUT_MAX: usize = 64 * 1024;
+            this.held_input.with_mut(|h| h.extend_from_slice(data));
+            if this.held_input.get().len() >= HELD_INPUT_MAX {
+                this.update_flags(|f| f.insert(Flags::HELD_INPUT_FULL));
+                this.pause_reads();
+            }
             return Ok(());
         }
         if this.native_callback.get().on_data(data)? {
@@ -2548,7 +2644,7 @@ impl<const SSL: bool> NewSocket<SSL> {
         if socket.is_shutdown() || socket.is_closed() {
             return -1;
         }
-        if SSL && self.flags.get().contains(Flags::REJECTED) {
+        if self.flags.get().contains(Flags::REJECTED) {
             return -1;
         }
         let res = socket.raw_writev(iov);
@@ -2564,11 +2660,11 @@ impl<const SSL: bool> NewSocket<SSL> {
             return -1;
         }
         let flags = self.flags.get();
-        if SSL && flags.contains(Flags::REJECTED) {
+        if flags.contains(Flags::REJECTED) {
             return -1;
         }
 
-        // The raw [raw, tls] upgrade twin shares the TLS half's us_socket_t
+        // The raw [raw, tls] upgrade half shares the TLS half's us_socket_t
         // (`s->ssl` is set) but must write raw bytes: write_check_error would
         // route it through the SSL-encrypting us_socket_write, and its fatal
         // signal is never set for TLS sockets anyway.
@@ -3061,7 +3157,7 @@ impl<const SSL: bool> NewSocket<SSL> {
         // A TLS socket whose handshake was rejected has no usable transport:
         // never push the buffered tail at it, and report no error (the
         // rejection is surfaced by the handshake path, not by the flush).
-        if SSL && self.flags.get().contains(Flags::REJECTED) {
+        if self.flags.get().contains(Flags::REJECTED) {
             return 0;
         }
         // R-2: every mutated field is `Cell`/`JsCell`, so `&self` carries no
@@ -3076,8 +3172,8 @@ impl<const SSL: bool> NewSocket<SSL> {
             // the initial write does: once the peer is gone the kernel rejects
             // every retry (EPIPE/ECONNRESET), and treating that as would-block
             // kept this buffer parked forever (the FIN-terminated-response hang).
-            // BYPASS_TLS twins keep the raw write path; TLS errors propagate
-            // through the SSL layer.
+            // The BYPASS_TLS raw half keeps the raw write path; TLS errors
+            // propagate through the SSL layer.
             let res: i32 = if self.flags.get().contains(Flags::BYPASS_TLS) {
                 self.do_socket_write(self.buffered_data_for_node_net.get().slice())
             } else {
@@ -3369,11 +3465,10 @@ impl<const SSL: bool> NewSocket<SSL> {
 
     /// In-place TCP→TLS upgrade. The underlying `us_socket_t` is
     /// `adoptTLS`'d into the per-VM TLS group with a fresh (or
-    /// SecureContext-shared) `SSL_CTX*`. Returns `[raw, tls]` — two
-    /// `TLSSocket` wrappers over one fd: `tls` is the encrypted view that
-    /// owns dispatch; `raw` has `bypass_tls` set so node:net's
-    /// `socket._handle` can pipe pre-handshake/tunnelled bytes via
-    /// `us_socket_raw_write`. No second context, no `Handlers.clone()`.
+    /// SecureContext-shared) `SSL_CTX*`. Returns `[raw, tls]`: `tls` is a new
+    /// `TLSSocket`, the encrypted view that owns dispatch; `raw` is this
+    /// socket itself, now with `BYPASS_TLS` (writes skip SSL, its handlers see
+    /// the ciphertext) — node:net keeps it as the wrapped socket's `_handle`.
     #[bun_jsc::host_fn(method)]
     pub(crate) fn upgrade_tls(
         this: &Self,
@@ -3411,6 +3506,11 @@ impl<const SSL: bool> NewSocket<SSL> {
                 "upgradeTLS requires an established socket"
             )));
         };
+        // Already the `raw` half of an upgrade (its handlers see ciphertext and
+        // may well call this again): same no-op as on a TLSSocket.
+        if this.flags.get().contains(Flags::BYPASS_TLS) {
+            return Ok(JSValue::UNDEFINED);
+        }
         if opts.is_empty_or_undefined_or_null() || opts.is_boolean() || !opts.is_object() {
             return Err(global.throw(format_args!("Expected options object")));
         }
@@ -3432,12 +3532,17 @@ impl<const SSL: bool> NewSocket<SSL> {
         // Bytes already consumed from the wire before the upgrade (e.g. the
         // ClientHello sitting in the readable buffer of the socket being
         // wrapped); fed into the TLS engine once the upgrade is wired up.
-        let initial_data: Vec<u8> = match opts.get_truthy(global, "initialData")? {
-            Some(v) => StringOrBuffer::from_js(global, v)?
-                .map(|data| data.slice().to_vec())
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
+        let initial_data = bytes_from_js(
+            global,
+            opts.get(global, "initialData")?
+                .unwrap_or(JSValue::UNDEFINED),
+        )?;
+        // node:net only: the wrapped socket still has plaintext queued, so the
+        // handshake waits for `startTLSHandshake` (see `Flags::HANDSHAKE_HELD`).
+        let defer_handshake = for_node_net
+            && opts
+                .get_truthy(global, "deferHandshake")?
+                .is_some_and(|v| v.to_boolean());
         // Client mode: a standalone `new TLSSocket(socket, { isServer })` is NOT
         // a SocketListener, so these handlers have no listener to release. The
         // server-ness lives in the SSL accept state (adopt_tls
@@ -3559,6 +3664,7 @@ impl<const SSL: bool> NewSocket<SSL> {
         let mut initial_flags = Flags::initial(reject_unauthorized);
         initial_flags.set(Flags::DEFERS_SERVER_IDENTITY, for_node_net);
         initial_flags.set(Flags::TLS_SERVER_ROLE, is_server);
+        initial_flags.set(Flags::HANDSHAKE_HELD, defer_handshake);
         let tls: bun_ptr::ThisPtr<TLSSocket> = TLSSocket::new(TLSSocket {
             ref_count: bun_ptr::RefCount::init(),
             handlers: JsCell::new(Some(handlers)),
@@ -3575,6 +3681,7 @@ impl<const SSL: bool> NewSocket<SSL> {
             poll_ref: JsCell::new(KeepAlive::init()),
             ref_pollref_on_connect: Cell::new(true),
             buffered_data_for_node_net: JsCell::new(Vec::new()),
+            held_input: JsCell::new(Vec::new()),
             bytes_written: Cell::new(0),
             native_callback: JsCell::new(NativeCallbacks::None),
             twin: JsCell::new(None),
@@ -3622,81 +3729,32 @@ impl<const SSL: bool> NewSocket<SSL> {
             }
         };
 
-        // Retire the original TCP wrapper before any TLS dispatch can run
-        // back into JS — it must not see two live owners on one fd. Its
-        // *Handlers are TRANSFERRED to the raw twin (the `[raw, tls]`
-        // contract is: index 0 keeps the pre-upgrade callbacks and sees
-        // ciphertext, index 1 gets the new ones and sees plaintext).
-        let raw_handlers = this.take_handlers();
+        // `this` becomes the `raw` half (see `twin`): it follows the fd into
+        // the new `us_socket_t` but is never in its ext slot.
+        // SAFETY: `if SSL` returned above, so `Self` is `TCPSocket`.
+        let raw: bun_ptr::ThisPtr<TCPSocket> =
+            unsafe { bun_ptr::ThisPtr::new(this.as_ctx_ptr().cast::<TCPSocket>()) };
         // Preserve `socket.unref()` across the upgrade — node:tls callers
         // that unref the underlying TCP socket before upgrading must not
         // suddenly hold the loop open via the TLS wrapper.
         let was_reffed = this.poll_ref.get().is_active();
-        // Capture before downgrade so the cached `data` (net.ts stores
-        // `{self: net.Socket}` there) survives onto the raw twin.
-        let original_data: JSValue =
-            Self::data_get_cached(this.get_this_value(global)).unwrap_or(JSValue::UNDEFINED);
-        original_data.ensure_still_alive();
-        if this.flags.get().contains(Flags::IS_ACTIVE) {
-            this.poll_ref.with_mut(|p| p.disable());
-            this.update_flags(|f| f.remove(Flags::IS_ACTIVE));
-            // Do NOT mark_inactive raw_handlers — ownership of the
-            // active_connections=1 it holds is transferring to `raw`.
-            this.this_value.with_mut(|r| r.downgrade());
-        }
-        // Release the retired TCP wrapper's ref on EVERY exit past this point,
-        // including the `?` early-returns below.
-        // SAFETY: `this` owns the outstanding ref this guard consumes; the JS
-        // wrapper's own +1 keeps the allocation alive across the whole call.
-        let _guard = unsafe { RefPtr::from_raw(this.as_ctx_ptr()) };
+        // `tls` holds the loop from here on.
+        this.poll_ref.with_mut(|p| p.unref(js_loop_ctx()));
         this.detach_native_callback();
-        this.socket.set(SocketHandler::<SSL>::DETACHED);
+        this.update_flags(|f| f.insert(Flags::BYPASS_TLS));
+        this.socket
+            .set(SocketHandler::<SSL>::from(new_raw.as_ptr()));
 
         // Only NOW is it safe for dispatch to fire: ext + kind point at `tls`.
         *uws::us_socket_t::opaque_mut(new_raw.as_ptr()).ext() = Some(tls);
         tls.socket
             .set(SocketHandler::<true>::from(new_raw.as_ptr()));
         tls.ref_();
-
-        // The `raw` half — same `us_socket_t*`, ORIGINAL pre-upgrade
-        // *Handlers, writes bypass SSL. Never in the ext slot: it gets
-        // close/end chained from `tls`, and data only via `ssl_raw_tap`
-        // (public `upgradeTLS` only).
-        let raw = TLSSocket::new(TLSSocket {
-            ref_count: bun_ptr::RefCount::init(),
-            handlers: JsCell::new(raw_handlers),
-            socket: Cell::new(SocketHandler::<true>::from(new_raw.as_ptr())),
-            owned_ssl_ctx: JsCell::new(None),
-            connection: JsCell::new(None),
-            local_binding: JsCell::new(None),
-            protos: JsCell::new(None),
-            server_name: JsCell::new(None),
-            // is_active so the chained `raw.on_close` → `mark_inactive` path
-            // releases `raw_handlers`. No poll_ref — `tls` keeps the loop
-            // alive. active_connections=1 was already on raw_handlers from
-            // `this`.
-            flags: Cell::new(Flags::BYPASS_TLS | Flags::IS_ACTIVE | Flags::OWNED_PROTOS),
-            this_value: JsCell::new(JsRef::empty()),
-            poll_ref: JsCell::new(KeepAlive::init()),
-            ref_pollref_on_connect: Cell::new(true),
-            buffered_data_for_node_net: JsCell::new(Vec::new()),
-            bytes_written: Cell::new(0),
-            native_callback: JsCell::new(NativeCallbacks::None),
-            twin: JsCell::new(None),
-            verify_error: JsCell::new(None),
-        });
-        let raw_ref = raw;
-        raw_ref.ref_();
-        // SAFETY: `raw` came from `TLSSocket::new` (heap::alloc); intrusive +1 held.
-        tls.twin
-            .set(Some(unsafe { RefPtr::from_raw(raw.as_ptr()) }));
+        tls.twin.set(Some(raw.ref_guard()));
 
         let tls_js_value = tls.get_this_value(global);
-        let raw_js_value = raw_ref.get_this_value(global);
+        let raw_js_value = raw.get_this_value(global);
         TLSSocket::data_set_cached(tls_js_value, global, default_data);
-        // `raw` keeps the pre-upgrade `data` so its callbacks emit on the
-        // original net.Socket, not the TLS one.
-        TLSSocket::data_set_cached(raw_js_value, global, original_data);
 
         tls.mark_active();
         if was_reffed {
@@ -3716,21 +3774,30 @@ impl<const SSL: bool> NewSocket<SSL> {
         }
         // Fire onOpen with the right `this`, then send ClientHello. Doing
         // it before ext was repointed would have ALPN/onOpen land in the
-        // dead TCPSocket.
+        // raw half's handlers.
         // What settling in the new socket's `on_open` left pending (a
         // terminating VM) is not run over: the handshake re-enters JS.
+        if defer_handshake {
+            bun_opaque::opaque_deref_mut(new_raw.as_ptr()).hold_tls_handshake();
+        }
         TLSSocket::on_open(tls, tls.socket.get())?;
-        bun_opaque::opaque_deref_mut(new_raw.as_ptr()).start_tls_handshake();
-        // The socket being wrapped may have had its readable interest off (an
-        // accepted socket nobody was reading yet — its ClientHello is still in
-        // the kernel buffer); make sure the adopted TLS socket is reading so
-        // the handshake can be driven. A no-op when it was already reading.
-        bun_opaque::opaque_deref_mut(new_raw.as_ptr()).resume();
-        // Feed bytes that arrived before the upgrade (already pulled off the fd
-        // by the plain-TCP layer) into the TLS engine exactly as if they had
-        // just been received — for a server-side wrap this is the ClientHello.
-        if !initial_data.is_empty() {
-            bun_opaque::opaque_deref_mut(new_raw.as_ptr()).tls_feed(initial_data.as_slice());
+        if tls.socket.get().is_detached() {
+            // closed from `onOpen`
+        } else if defer_handshake {
+            bun_opaque::opaque_deref_mut(new_raw.as_ptr()).resume();
+        } else {
+            bun_opaque::opaque_deref_mut(new_raw.as_ptr()).start_tls_handshake();
+            // The socket being wrapped may have had its readable interest off (an
+            // accepted socket nobody was reading yet — its ClientHello is still in
+            // the kernel buffer); make sure the adopted TLS socket is reading so
+            // the handshake can be driven. A no-op when it was already reading.
+            bun_opaque::opaque_deref_mut(new_raw.as_ptr()).resume();
+            // Feed bytes that arrived before the upgrade (already pulled off the fd
+            // by the plain-TCP layer) into the TLS engine exactly as if they had
+            // just been received — for a server-side wrap this is the ClientHello.
+            if !initial_data.is_empty() {
+                bun_opaque::opaque_deref_mut(new_raw.as_ptr()).tls_feed(initial_data.as_slice());
+            }
         }
         // After `initial_data`: those bytes already went through `raw`'s
         // handlers once on their way in.
@@ -4063,8 +4130,9 @@ pub enum NativeCallbacks {
     H2(RefPtr<H2FrameParser>),
     /// This socket is the transport under a stream-level TLS engine
     /// (`upgradeDuplexToTLS` over a handle-backed net.Socket: named pipes,
-    /// TLS over TLS). Its bytes go to that engine, never to the JS handlers —
-    /// node's TLSWrap taking over the parent's stream.
+    /// TLS over TLS, Http2SecureServer's injected sockets). Its bytes and EOF
+    /// go to that engine, never to the JS handlers — node's TLSWrap taking
+    /// over the parent's stream.
     TlsTransport(RefPtr<TLSSocket>),
     None,
 }
@@ -4078,7 +4146,7 @@ impl NativeCallbacks {
         let h2 = match self {
             NativeCallbacks::H2(h2) => h2.as_ptr(),
             NativeCallbacks::TlsTransport(inner) => {
-                let uws::InternalSocket::UpgradedDuplex(d) = inner.socket.get().socket else {
+                let Some(engine) = Self::engine(inner) else {
                     // The engine's teardown detaches us before its socket goes.
                     debug_assert!(false, "TlsTransport outlived its engine");
                     return Ok(false);
@@ -4086,9 +4154,7 @@ impl NativeCallbacks {
                 // Own +1 across the feed: decrypted data re-enters JS, which
                 // may close this transport and drop the cell's ref.
                 let _keep = inner.clone();
-                // SAFETY: same allocation, runtime-side type (uws_sys shim);
-                // live while `inner.socket` names it.
-                unsafe { &*d.cast::<UpgradedDuplex>() }.on_transport_data(data);
+                engine.on_transport_data(data);
                 return Ok(true);
             }
             NativeCallbacks::None => return Ok(false),
@@ -4100,12 +4166,47 @@ impl NativeCallbacks {
     pub(crate) fn on_writable(&self) -> bool {
         let h2 = match self {
             NativeCallbacks::H2(h2) => h2.as_ptr(),
-            // The engine writes through the JS stream; its drain is JS's.
+            // The engine writes through the JS stream, whose `drain` is JS's.
             NativeCallbacks::TlsTransport(_) | NativeCallbacks::None => return false,
         };
         // SAFETY: `on_native_writable` takes a keepalive; `h2` stays live across re-entry.
         unsafe { (*h2).on_native_writable() };
         true
+    }
+
+    /// `false`: also dispatch to the JS handlers.
+    pub(crate) fn on_end(&self) -> bool {
+        if let NativeCallbacks::TlsTransport(inner) = self {
+            if let Some(engine) = Self::engine(inner) {
+                let _keep = inner.clone();
+                engine.on_transport_end();
+            }
+        }
+        // node:net's own end handler still runs the wrapped socket's
+        // half-open logic.
+        false
+    }
+
+    /// The transport closed under the engine.
+    pub(crate) fn on_close(self) {
+        match self {
+            NativeCallbacks::H2(h2) => h2.on_native_close(),
+            NativeCallbacks::TlsTransport(inner) => {
+                if let Some(engine) = Self::engine(&inner) {
+                    engine.close();
+                }
+            }
+            NativeCallbacks::None => {}
+        }
+    }
+
+    fn engine(inner: &RefPtr<TLSSocket>) -> Option<&UpgradedDuplex> {
+        match inner.socket.get().socket {
+            // SAFETY: same allocation, runtime-side type (uws_sys shim); live
+            // while `inner.socket` names it.
+            uws::InternalSocket::UpgradedDuplex(d) => Some(unsafe { &*d.cast::<UpgradedDuplex>() }),
+            _ => None,
+        }
     }
 }
 
@@ -4116,6 +4217,17 @@ impl NativeCallbacks {
 enum WriteResult {
     Fail,
     Success { wrote: i32, total: usize },
+}
+
+/// An optional string/buffer argument, copied out (it is fed to C after calls
+/// that re-enter JS).
+fn bytes_from_js(global: &JSGlobalObject, value: JSValue) -> JsResult<Vec<u8>> {
+    if value.is_empty_or_undefined_or_null() {
+        return Ok(Vec::new());
+    }
+    Ok(StringOrBuffer::from_js(global, value)?
+        .map(|d| d.slice().to_vec())
+        .unwrap_or_default())
 }
 
 pub(crate) struct StoredVerifyError {
@@ -4159,10 +4271,12 @@ bitflags::bitflags! {
         const TLS_SERVER_ROLE      = 1 << 14;
         /// node:net's `pauseOnConnect`: paused in `on_open` (plain; free for a socket that was registered with `LIBUS_SOCKET_OPEN_PAUSED`) or after the handshake (TLS).
         const PAUSE_ON_CONNECT     = 1 << 15;
-        /// node:net is about to hand this fd to a TLS layer and is only waiting
-        /// for queued plaintext to flush: what the peer sends meanwhile stays in
-        /// the kernel for that layer, so JS `resume()` is ignored until then.
-        const READS_HELD_FOR_UPGRADE = 1 << 16;
+        /// Adopted into TLS behind the previous owner's queued plaintext (node's
+        /// `wrapHasActiveWriteFromPrevOwner`): until `startTLSHandshake` uSockets
+        /// emits no TLS and hands inbound bytes over raw (kept in `held_input`).
+        const HANDSHAKE_HELD       = 1 << 16;
+        /// `held_input` reached its cap and paused reads; `startTLSHandshake` resumes.
+        const HELD_INPUT_FULL      = 1 << 17;
     }
 }
 
@@ -4744,6 +4858,7 @@ pub fn js_upgrade_duplex_to_tls(
         poll_ref: JsCell::new(KeepAlive::init()),
         ref_pollref_on_connect: Cell::new(true),
         buffered_data_for_node_net: JsCell::new(Vec::new()),
+        held_input: JsCell::new(Vec::new()),
         bytes_written: Cell::new(0),
         native_callback: JsCell::new(NativeCallbacks::None),
         twin: JsCell::new(None),
@@ -4896,7 +5011,8 @@ pub fn js_upgrade_duplex_to_tls(
 
     let array = JSValue::create_empty_array(global, 2)?;
     array.put_index(global, 0, tls_js_value)?;
-    // end, drain and close (and data, for a JS-only stream) come from JS.
+    // The engine's intake as JS functions: all four for a Duplex; a
+    // handle-backed transport only uses `data`, for what it had buffered.
     array.put_index(
         global,
         1,

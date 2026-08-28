@@ -893,8 +893,9 @@ TLSSocket.prototype._final = function _final(callback) {
   // A never-connected TLSSocket (e.g. new tls.TLSSocket().end(cb)) has no handle
   // and no handshake to wait for; finish immediately like NetSocket._final's
   // no-handle fast path, otherwise the deferred callback would never fire. One
-  // wrapping a net.Socket that is still connecting or flushing gets its handle
-  // (and handshake) later, so it waits like the handshaking case below.
+  // wrapping a live net.Socket gets its handle a moment later (on 'connect',
+  // or the server-side wrap's next tick), so it waits like the handshaking
+  // case below; if that socket dies first this one is destroyed with it.
   if (!this._handle && !(this._parent && !this._parent.destroyed && this.secureConnecting)) return callback();
   if (this.secureConnecting) {
     // kSecureConnectDone rather than 'secureConnect': server-side sockets

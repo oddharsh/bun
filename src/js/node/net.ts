@@ -148,9 +148,8 @@ const kSyncWriteFd = Symbol("kSyncWriteFd");
 const kSetKeepAliveInitialDelay = Symbol("kSetKeepAliveInitialDelay");
 const kConnectOptions = Symbol("connect-options");
 const kAttach = Symbol("kAttach");
-const kCloseRawConnection = Symbol("kCloseRawConnection");
+const kTLSLayer = Symbol("kTLSLayer");
 const kupgraded = Symbol("kupgraded");
-const kAdoptedTLSRaw = Symbol("kAdoptedTLSRaw");
 const ksocket = Symbol("ksocket");
 const khandlers = Symbol("khandlers");
 const kclosed = Symbol("closed");
@@ -1894,18 +1893,11 @@ Socket.prototype[kAttach] = function (port, socket) {
   SocketHandlers.drain(socket);
 };
 
-Socket.prototype[kCloseRawConnection] = function () {
-  const connection = this[kupgraded];
-  connection.connecting = false;
-  connection._handle = null;
-  connection.unref();
-  connection.destroy();
-};
-
 // A TLS socket lives and dies with the stream it wraps:
 // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L740
 // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L977
 function tieToWrappedStream(self, connection) {
+  connection[kTLSLayer] = self;
   connection.on("close", () => {
     if (!self.destroyed) self.destroy();
   });
@@ -1914,39 +1906,15 @@ function tieToWrappedStream(self, connection) {
   });
 }
 
-// Node's TLSWrap queues an empty write behind the previous owner's pending
-// ones and emits nothing until it completes; adopt the fd at that point. Reads
-// are held meanwhile so whatever the peer sends stays in the kernel for TLS.
-// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L579
-// https://github.com/nodejs/node/blob/v26.3.0/src/crypto/crypto_tls.cc#L662-L667
-function adoptAfterWritesFlush(self, connection, data, handlers, isServer, tls) {
-  connection._handle.holdReadsForUpgrade();
-  connection.write("", err => {
-    if (err || self.destroyed || connection.destroyed || !connection._handle) {
-      // Like node, the wrapped socket goes down with the TLS one (_destroy).
-      self.destroy(err);
-      return;
-    }
-    try {
-      if (adoptConnection(self, connection, data, handlers, isServer, tls) && isServer) {
-        self.emit(kUpgradeAttached);
-      }
-    } catch (e) {
-      self.destroy(e);
-    }
-  });
-}
-
 // Hands `connection`'s fd to a native TLS socket that becomes `self._handle`;
-// `connection` keeps the `raw` half for close/destroy/address but sees no more
+// `connection` keeps its handle for close/destroy/address but sees no more
 // bytes (node's `_parentWrap`). What it had already pulled off the wire goes
 // with it: https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L502-L519
-// Returns false when the adoption did not happen (yet).
+// Plaintext it still has queued goes out before any TLS record: the handshake
+// is held until an empty write queued behind it completes, as in
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L579-L613
+// Returns false if `self` had to be destroyed instead.
 function adoptConnection(self, connection, data, handlers, isServer, tls) {
-  if (hasUnflushedWrites(connection)) {
-    adoptAfterWritesFlush(self, connection, data, handlers, isServer, tls);
-    return false;
-  }
   let pending: Buffer | undefined;
   if (connection.readableLength) {
     const chunks: Buffer[] = [];
@@ -1963,24 +1931,28 @@ function adoptConnection(self, connection, data, handlers, isServer, tls) {
   // The TLS layer reads from here on, so the fd holds the loop again even if
   // `connection` had stopped reading (readStop).
   restorePausedHold(connection, connection._handle);
+  const deferHandshake = hasUnflushedWrites(connection);
   const result = nodeNetUpgradeTLS(connection._handle, {
     data,
     tls,
     socket: handlers,
     isServer,
-    initialData: pending,
+    deferHandshake,
+    initialData: deferHandshake ? undefined : pending,
   });
   if (!result) {
     self._handle = null;
     self.destroy(new Error("Invalid socket"));
     return false;
   }
-  const [raw, tlsHandle] = result;
-  connection._handle = raw;
-  raw[kAdoptedTLSRaw] = true;
-  self.once("end", self[kCloseRawConnection]);
-  raw.connecting = false;
+  const tlsHandle = result[1];
   self._handle = tlsHandle;
+  if (deferHandshake) {
+    connection.write("", err => {
+      // On failure `connection` is erroring/closing, and `self` with it.
+      if (!err && self._handle === tlsHandle && !connection.destroyed) tlsHandle.startTLSHandshake(pending);
+    });
+  }
   return true;
 }
 
@@ -2010,6 +1982,12 @@ function adoptServerConnection(self, connection, tls) {
 
 Socket.prototype.connect = function connect(...args) {
   $debug("Socket.prototype.connect");
+  // Its fd belongs to a TLS layer now: report what connect(2) would rather
+  // than tear the fd out from under it.
+  if (this._handle?.fdIsTLS) {
+    process.nextTick(destroyNT, this, new ErrnoException(uv().UV_EISCONN, "connect"));
+    return this;
+  }
   {
     const [options, connectListener] =
       $isArray(args[0]) && args[0][normalizedArgsSymbol] ? args[0] : normalizeArgs(args);
@@ -2207,9 +2185,8 @@ Socket.prototype._destroy = function _destroy(err, callback) {
   // The wrapped stream goes down with this socket, as in node:
   // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L686
   // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/js_stream_socket.js#L253
-  // A socket whose fd was adopted shares it with this one and closes with it.
   const upgraded = this[kupgraded];
-  if (upgraded && !upgraded.destroyed && !upgraded._handle?.[kAdoptedTLSRaw]) {
+  if (upgraded && !upgraded.destroyed) {
     upgraded.destroy?.();
   }
 
@@ -2261,7 +2238,7 @@ Socket.prototype._destroy = function _destroy(err, callback) {
       // Enqueue closing the socket as a microtask, so that the socket can be
       // accessible when an `error` event is handled in the `next tick queue`.
       queueMicrotask(() => closeSocketHandle(this, isException, true));
-    } else if (currentHandle[kAdoptedTLSRaw]) {
+    } else if (currentHandle.fdIsTLS) {
       // Shared-fd TLS pair: defer the close two check-phase turns
       // (test-tls-socket-close); see closeAdoptedTLSRawNT.
       currentHandle.pause?.();
@@ -2337,7 +2314,7 @@ Object.defineProperty(Socket.prototype, "pending", {
 });
 
 // Queued/in-flight plain writes must reach the wire before any TLS record
-// (see adoptAfterWritesFlush).
+// (see adoptConnection).
 function hasUnflushedWrites(connection) {
   return connection.writableLength > 0 || connection[kwriteCallback] != null;
 }
@@ -2494,6 +2471,8 @@ Socket.prototype.ref = function ref() {
     return this;
   }
   socket.ref();
+  // Its fd is a TLS layer's now; that is what holds the loop (node: one uv handle).
+  if (socket.fdIsTLS) this[kTLSLayer]?._handle?.ref();
   return this;
 };
 
@@ -2688,6 +2667,7 @@ Socket.prototype.unref = function unref() {
     return this;
   }
   socket.unref();
+  if (socket.fdIsTLS) this[kTLSLayer]?._handle?.unref();
   return this;
 };
 

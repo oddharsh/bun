@@ -64,9 +64,10 @@ pub(crate) struct UpgradedDuplex {
     /// Replayed by [`Self::drain_pending`] after the staged bytes, preserving
     /// the original data-then-EOF order.
     pub pending_end: Cell<bool>,
-    /// The handle-backed socket this engine runs over, when there is one (its
-    /// `NativeCallbacks::TlsTransport` feeds us). Flow control goes to it, and
-    /// teardown hands it back its reads.
+    /// The handle-backed socket this engine runs over, when there is one: its
+    /// `NativeCallbacks::TlsTransport` delivers data/end/close, flow control
+    /// goes to it, and teardown hands it back. Ciphertext out (and so
+    /// `drain`) goes through the JS stream either way.
     pub transport: JsCell<Transport>,
 }
 
@@ -435,10 +436,27 @@ impl UpgradedDuplex {
 
     fn release_transport(&self) {
         match self.transport.replace(Transport::None) {
-            Transport::Tcp(t) => t.detach_native_callback(),
-            Transport::Tls(t) => t.detach_native_callback(),
+            Transport::Tcp(t) => t.clear_native_callback(),
+            Transport::Tls(t) => t.clear_native_callback(),
             Transport::None => {}
         }
+    }
+
+    /// The transport's EOF (its JS `end` event, or natively).
+    pub(crate) fn on_transport_end(&self) {
+        if self.wrapper_ref().is_some() {
+            (self.handlers.on_end)(self.handlers.ctx);
+        } else {
+            // EOF before `start_tls` ran. Hold it so `drain_pending` reports it
+            // in order, after any bytes staged in the same window.
+            self.pending_end.set(true);
+        }
+    }
+
+    /// The transport's JS `drain`.
+    pub(crate) fn on_transport_writable(&self) {
+        self.flush();
+        (self.handlers.on_writable)(self.handlers.ctx);
     }
 
     pub(crate) fn get_js_handlers(&self, global: &JSGlobalObject) -> JsResult<JSValue> {
@@ -765,15 +783,7 @@ fn on_end(_global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue> {
 
     if let Some(self_ptr) = host_fn::get_function_data(function) {
         // SAFETY: see host-fn note above.
-        let this = unsafe { &*self_ptr.cast::<UpgradedDuplex>() };
-
-        if this.wrapper_ref().is_some() {
-            (this.handlers.on_end)(this.handlers.ctx);
-        } else {
-            // EOF before `start_tls` ran. Hold it so `drain_pending` reports it
-            // in order, after any bytes staged in the same window.
-            this.pending_end.set(true);
-        }
+        unsafe { &*self_ptr.cast::<UpgradedDuplex>() }.on_transport_end();
     }
     Ok(JSValue::UNDEFINED)
 }
@@ -786,11 +796,7 @@ fn on_writable(_global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSValue>
 
     if let Some(self_ptr) = host_fn::get_function_data(function) {
         // SAFETY: see host-fn note above.
-        let this = unsafe { &*self_ptr.cast::<UpgradedDuplex>() };
-        // flush pending data
-        this.flush();
-        // call onWritable (will flush on demand)
-        (this.handlers.on_writable)(this.handlers.ctx);
+        unsafe { &*self_ptr.cast::<UpgradedDuplex>() }.on_transport_writable();
     }
 
     Ok(JSValue::UNDEFINED)
