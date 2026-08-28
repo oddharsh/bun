@@ -1,6 +1,5 @@
 const { Duplex } = require("node:stream");
-const { attachTLSFeeder, detachTLSFeeder } = require("internal/net/tlsFeeder");
-const upgradeDuplexToTLS = $newRustFunction("runtime/socket/socket.rs", "jsUpgradeDuplexToTLS", 2);
+const { upgradeStreamToTLS } = require("internal/net/streamTLS");
 const kSharedCreds = Symbol.for("::buntlssharedcreds::");
 
 interface NativeHandle {
@@ -141,8 +140,11 @@ function socketOpen() {}
 
 // data: called with decrypted plaintext after the TLS layer decrypts incoming data.
 // Push into tlsSocket so the H2 session's _read() receives these frames.
-function socketData(this: TLSProxySocket, _socket: NativeHandle, chunk: Buffer) {
+function socketData(this: TLSProxySocket, socket: NativeHandle, chunk: Buffer) {
+  this._ctx.rawSocket._unrefTimer?.();
   if (!this.push(chunk)) {
+    // A handle-backed raw socket is read below its stream: pause the handle.
+    socket.pause();
     this._ctx.rawSocket.pause();
   }
 }
@@ -259,10 +261,12 @@ function onTlsClose(this: TLSProxySocket) {
   const raw = ctx.rawSocket;
   const ev = ctx.events;
   if (!ev) return;
-  detachTLSFeeder(raw, ev[0]);
+  raw.removeListener("data", ev[0]);
   raw.removeListener("end", ev[1]);
   raw.removeListener("drain", ev[2]);
   raw.removeListener("close", ev[3]);
+  // The raw socket goes down with the session's TLS socket, as in node.
+  raw.destroy();
 }
 
 // ---------------------------------------------------------------------------
@@ -287,9 +291,9 @@ function noop() {}
 // targets the H2 connectionListener instead of a generic secureConnection event.
 //
 // Data flow after upgrade:
-//   rawSocket (TCP) → upgradeDuplexToTLS (native TLS layer) → socket callbacks
-//     → tlsSocket.push() → H2 session reads
-//   H2 session writes → tlsSocket._write() → handle.$write() → native TLS layer → rawSocket
+//   rawSocket (read natively when it is a net.Socket, else via 'data') → native
+//     TLS layer → socket callbacks → tlsSocket.push() → H2 session reads
+//   H2 session writes → tlsSocket._write() → handle.$write() → native TLS layer → rawSocket.write()
 //
 // CRITICAL: We do NOT set tlsSocket._handle to the native TLS handle.
 // If we did, the H2FrameParser constructor would detect it as a JSTLSSocket
@@ -335,15 +339,15 @@ function upgradeRawSocketToH2(
   // socket: callbacks — bind to tlsSocket since they are invoked with the native handle as `this`
   let handle: NativeHandle, events: UpgradeContextType["events"];
   try {
-    // upgradeDuplexToTLS wraps rawSocket with a TLS layer in server mode (isServer: true).
-    // The native side will:
-    //   1. Read encrypted data from rawSocket via events[0..3]
+    // upgradeStreamToTLS wraps rawSocket with a TLS layer in server mode (isServer: true)
+    // and wires rawSocket's bytes/end/drain/close into it. The native side will:
+    //   1. Read encrypted data from rawSocket
     //   2. Decrypt it through the TLS engine (with ALPN negotiation for "h2")
     //   3. Call our socket callbacks below with the decrypted plaintext
     //
     // ALPNProtocols: server.ALPNProtocols is a Buffer in wire format (e.g. <Buffer 02 68 32>
     // for ["h2"]). The native SSLConfig expects an ArrayBuffer, so we slice the underlying buffer.
-    [handle, events] = upgradeDuplexToTLS(rawSocket, {
+    [handle, events] = upgradeStreamToTLS(tlsSocket, rawSocket, {
       isServer: true,
       tls: {
         secureContext: server[kSharedCreds]().context,
@@ -379,14 +383,6 @@ function upgradeRawSocketToH2(
   // intercept data at the native level and bypass our Duplex push path.
   tlsSocket._ctx.nativeHandle = handle;
   tlsSocket._ctx.events = events;
-
-  // Wire up the raw TCP socket to feed encrypted data into the TLS layer.
-  // events[0..3] are native event handlers returned by upgradeDuplexToTLS that
-  // the native TLS engine expects to receive data/end/drain/close through.
-  attachTLSFeeder(rawSocket, events[0]);
-  rawSocket.on("end", events[1]);
-  rawSocket.on("drain", events[2]);
-  rawSocket.on("close", events[3]);
 
   // When the TLS socket closes (e.g. H2 session destroyed), clean up the raw socket
   // listeners to prevent memory leaks and stale callback references.

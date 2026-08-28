@@ -28,6 +28,10 @@ function generate(ssl) {
         fn: "pauseFromJS",
         length: 0,
       },
+      holdReadsForUpgrade: {
+        fn: "holdReadsForUpgrade",
+        length: 0,
+      },
 
       getTLSFinishedMessage: {
         fn: "getTLSFinishedMessage",

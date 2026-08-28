@@ -64,6 +64,17 @@ pub(crate) struct UpgradedDuplex {
     /// Replayed by [`Self::drain_pending`] after the staged bytes, preserving
     /// the original data-then-EOF order.
     pub pending_end: Cell<bool>,
+    /// The handle-backed socket this engine runs over, when there is one (its
+    /// `NativeCallbacks::TlsTransport` feeds us). Flow control goes to it, and
+    /// teardown hands it back its reads.
+    pub transport: JsCell<Transport>,
+}
+
+/// See [`UpgradedDuplex::transport`].
+pub enum Transport {
+    None,
+    Tcp(bun_ptr::RefPtr<super::TCPSocket>),
+    Tls(bun_ptr::RefPtr<super::TLSSocket>),
 }
 
 bun_event_loop::impl_timer_owner!(UpgradedDuplex; from_timer_ptr => event_loop_timer);
@@ -287,7 +298,9 @@ impl UpgradedDuplex {
         }
     }
 
-    fn on_internal_receive_data(&self, data: &[u8]) {
+    /// Ciphertext from the transport (a JS `data` chunk, or a handle-backed
+    /// socket's native read via `NativeCallbacks::TlsTransport`).
+    pub(crate) fn on_transport_data(&self, data: &[u8]) {
         if let Some(w) = self.wrapper_ref() {
             self.reset_timeout();
             w.receive_data(data);
@@ -396,6 +409,35 @@ impl UpgradedDuplex {
             current_timeout: Cell::new(0),
             pending_data: JsCell::new(Vec::new()),
             pending_end: Cell::new(false),
+            transport: JsCell::new(Transport::None),
+        }
+    }
+
+    #[uws_callback(export = "UpgradedDuplex__pause")]
+    pub(crate) fn pause(&self) -> bool {
+        match self.transport.get() {
+            Transport::Tcp(t) => t.pause_reads(),
+            Transport::Tls(t) => t.pause_reads(),
+            Transport::None => return false,
+        }
+        true
+    }
+
+    #[uws_callback(export = "UpgradedDuplex__resume")]
+    pub(crate) fn resume(&self) -> bool {
+        match self.transport.get() {
+            Transport::Tcp(t) => t.resume_reads(),
+            Transport::Tls(t) => t.resume_reads(),
+            Transport::None => return false,
+        }
+        true
+    }
+
+    fn release_transport(&self) {
+        match self.transport.replace(Transport::None) {
+            Transport::Tcp(t) => t.detach_native_callback(),
+            Transport::Tls(t) => t.detach_native_callback(),
+            Transport::None => {}
         }
     }
 
@@ -666,6 +708,7 @@ impl UpgradedDuplex {
         self.ssl_error.set(CertError::default());
         self.pending_data.set(Vec::new());
         self.pending_end.set(false);
+        self.release_transport();
     }
 }
 
@@ -697,7 +740,7 @@ fn on_received_data(global: &JSGlobalObject, frame: &CallFrame) -> JsResult<JSVa
                 if let Some(array_buffer) = data_arg.as_array_buffer(global) {
                     // yay we can read the data
                     let payload = array_buffer.slice();
-                    this.on_internal_receive_data(payload);
+                    this.on_transport_data(payload);
                 } else {
                     // node.js errors in this case with the same error, lets keep it consistent
                     let error_value = global

@@ -23,7 +23,7 @@ use bun_jsc::{self as jsc, CallFrame, JSGlobalObject, JSValue, JsRef, JsResult, 
 use bun_jsc::SysErrorJsc;
 // `bun_jsc::VirtualMachine` is the *module* (alias of `virtual_machine`); name the
 // struct directly so `VirtualMachine::get()` resolves as an associated fn.
-use super::upgraded_duplex::{Handlers as UpgradedDuplexHandlers, UpgradedDuplex};
+use super::upgraded_duplex::{Handlers as UpgradedDuplexHandlers, Transport, UpgradedDuplex};
 use crate::crypto::boringssl_jsc::err_to_js as boringssl_err_to_js;
 use crate::node::{BlobOrStringOrBuffer, StringObjects, StringOrBuffer};
 use crate::socket::{SSLConfig, SSLConfigFromJs};
@@ -445,7 +445,7 @@ impl<const SSL: bool> Drop for ScopeExit<SSL> {
 impl<const SSL: bool> NewSocket<SSL> {
     /// Hold a ref on `self` for the guard's lifetime (across re-entrant calls).
     #[inline]
-    fn ref_guard(&self) -> RefPtr<Self> {
+    pub(crate) fn ref_guard(&self) -> RefPtr<Self> {
         // SAFETY: `self` is the live heap allocation.
         unsafe { RefPtr::init_ref(self.as_ctx_ptr()) }
     }
@@ -714,12 +714,35 @@ impl<const SSL: bool> NewSocket<SSL> {
         // The raw half of an upgradeTLS pair is an observation tap; flow
         // control belongs to the TLS half. Pausing the shared fd here would
         // wedge the TLS read path (#15438).
-        if this.flags.get().contains(Flags::BYPASS_TLS) {
+        if this
+            .flags
+            .get()
+            .intersects(Flags::BYPASS_TLS | Flags::READS_HELD_FOR_UPGRADE)
+        {
             return Ok(JSValue::UNDEFINED);
         }
-        if this.flags.get().contains(Flags::IS_PAUSED) {
-            let resumed = this.socket.get().resume_stream();
-            this.update_flags(|f| f.set(Flags::IS_PAUSED, !resumed));
+        this.resume_reads();
+        Ok(JSValue::UNDEFINED)
+    }
+
+    pub(crate) fn resume_reads(&self) {
+        if self.flags.get().contains(Flags::IS_PAUSED) {
+            let resumed = self.socket.get().resume_stream();
+            self.update_flags(|f| f.set(Flags::IS_PAUSED, !resumed));
+        }
+    }
+
+    /// See `Flags::READS_HELD_FOR_UPGRADE`. The hold ends with this wrapper:
+    /// the upgrade retires it, an aborted upgrade destroys it.
+    #[bun_jsc::host_fn(method)]
+    pub(crate) fn hold_reads_for_upgrade(
+        this: &Self,
+        _global: &JSGlobalObject,
+        _frame: &CallFrame,
+    ) -> JsResult<JSValue> {
+        if !this.socket.get().is_detached() {
+            this.pause_reads();
+            this.update_flags(|f| f.insert(Flags::READS_HELD_FOR_UPGRADE));
         }
         Ok(JSValue::UNDEFINED)
     }
@@ -742,7 +765,7 @@ impl<const SSL: bool> NewSocket<SSL> {
         Ok(JSValue::UNDEFINED)
     }
 
-    fn pause_reads(&self) {
+    pub(crate) fn pause_reads(&self) {
         if !self.flags.get().contains(Flags::IS_PAUSED) {
             let paused = self.socket.get().pause_stream();
             self.update_flags(|f| f.set(Flags::IS_PAUSED, paused));
@@ -4038,6 +4061,11 @@ impl_socket_js_class!(TLSSocket, js_TLSSocket);
 
 pub enum NativeCallbacks {
     H2(RefPtr<H2FrameParser>),
+    /// This socket is the transport under a stream-level TLS engine
+    /// (`upgradeDuplexToTLS` over a handle-backed net.Socket: named pipes,
+    /// TLS over TLS). Its bytes go to that engine, never to the JS handlers —
+    /// node's TLSWrap taking over the parent's stream.
+    TlsTransport(RefPtr<TLSSocket>),
     None,
 }
 
@@ -4049,6 +4077,20 @@ impl NativeCallbacks {
     pub(crate) fn on_data(&self, data: &[u8]) -> JsResult<bool> {
         let h2 = match self {
             NativeCallbacks::H2(h2) => h2.as_ptr(),
+            NativeCallbacks::TlsTransport(inner) => {
+                let uws::InternalSocket::UpgradedDuplex(d) = inner.socket.get().socket else {
+                    // The engine's teardown detaches us before its socket goes.
+                    debug_assert!(false, "TlsTransport outlived its engine");
+                    return Ok(false);
+                };
+                // Own +1 across the feed: decrypted data re-enters JS, which
+                // may close this transport and drop the cell's ref.
+                let _keep = inner.clone();
+                // SAFETY: same allocation, runtime-side type (uws_sys shim);
+                // live while `inner.socket` names it.
+                unsafe { &*d.cast::<UpgradedDuplex>() }.on_transport_data(data);
+                return Ok(true);
+            }
             NativeCallbacks::None => return Ok(false),
         };
         // SAFETY: `on_native_read` takes a keepalive; `h2` stays live across re-entry.
@@ -4058,7 +4100,8 @@ impl NativeCallbacks {
     pub(crate) fn on_writable(&self) -> bool {
         let h2 = match self {
             NativeCallbacks::H2(h2) => h2.as_ptr(),
-            NativeCallbacks::None => return false,
+            // The engine writes through the JS stream; its drain is JS's.
+            NativeCallbacks::TlsTransport(_) | NativeCallbacks::None => return false,
         };
         // SAFETY: `on_native_writable` takes a keepalive; `h2` stays live across re-entry.
         unsafe { (*h2).on_native_writable() };
@@ -4086,7 +4129,7 @@ pub(crate) struct StoredVerifyError {
 
 bitflags::bitflags! {
     #[derive(Clone, Copy, PartialEq, Eq)]
-    pub struct Flags: u16 {
+    pub struct Flags: u32 {
         const IS_ACTIVE            = 1 << 0;
         /// Prevent onClose from calling into JavaScript while we are finalizing
         const FINALIZING           = 1 << 1;
@@ -4116,6 +4159,10 @@ bitflags::bitflags! {
         const TLS_SERVER_ROLE      = 1 << 14;
         /// node:net's `pauseOnConnect`: paused in `on_open` (plain; free for a socket that was registered with `LIBUS_SOCKET_OPEN_PAUSED`) or after the handshake (TLS).
         const PAUSE_ON_CONNECT     = 1 << 15;
+        /// node:net is about to hand this fd to a TLS layer and is only waiting
+        /// for queued plaintext to flush: what the peer sends meanwhile stays in
+        /// the kernel for that layer, so JS `resume()` is ignored until then.
+        const READS_HELD_FOR_UPGRADE = 1 << 16;
     }
 }
 
@@ -4452,7 +4499,7 @@ impl DuplexUpgradeContext {
                 }
                 this.ssl_config.set(None); // Drop frees.
                 // Bytes the peer sent while this task was still queued were
-                // staged by `UpgradedDuplex::on_internal_receive_data` (the
+                // staged by `UpgradedDuplex::on_transport_data` (the
                 // engine did not exist yet to receive them). Feed them now
                 // that StartTLS is fully done, so the replay is ordered
                 // exactly like an ordinary post-start delivery. Without this
@@ -4649,6 +4696,9 @@ pub fn js_upgrade_duplex_to_tls(
         default_data = v;
         default_data.ensure_still_alive();
     }
+    let transport = opts
+        .get_truthy(global, "transport")?
+        .unwrap_or(JSValue::UNDEFINED);
 
     let reject_unauthorized = upgrade_reject_policy(
         handlers.vm,
@@ -4821,9 +4871,32 @@ pub fn js_upgrade_duplex_to_tls(
     .register();
     DuplexUpgradeContext::start_tls(duplex_context_ref);
 
+    // A handle-backed transport hands its bytes to the engine below JS.
+    let feed = || NativeCallbacks::TlsTransport(RefPtr::from_this(tls));
+    let linked = if let Some(t) = transport.as_class_ref::<TCPSocket>() {
+        t.attach_native_callback(feed())
+            .then(|| Transport::Tcp(t.ref_guard()))
+    } else if let Some(t) = transport.as_class_ref::<TLSSocket>() {
+        t.attach_native_callback(feed())
+            .then(|| Transport::Tls(t.ref_guard()))
+    } else {
+        None
+    };
+    if !transport.is_undefined() && linked.is_none() {
+        // Its reads already go somewhere else (an HTTP/2 session, another TLS
+        // layer); `data` events would never come either.
+        return Err(global.throw(format_args!(
+            "This socket is already consumed by another native reader"
+        )));
+    }
+    duplex_context_ref
+        .upgrade
+        .transport
+        .set(linked.unwrap_or(Transport::None));
+
     let array = JSValue::create_empty_array(global, 2)?;
     array.put_index(global, 0, tls_js_value)?;
-    // data, end, drain and close events must be reported
+    // end, drain and close (and data, for a JS-only stream) come from JS.
     array.put_index(
         global,
         1,

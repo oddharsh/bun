@@ -64,10 +64,11 @@ test("should be able to upgrade a paused socket and also have backpressure on it
 // Once a TLS layer is put on top of a net.Socket (tls.connect({ socket }),
 // new TLSSocket(socket, { isServer: true })) the bytes that socket keeps
 // receiving belong to the TLS layer: none of them may surface as `data` on the
-// wrapped socket or pile up in its readable buffer. Both upgrade paths are
-// covered: fd adoption, and the stream-level engine that is used while the
-// socket still has unflushed writes (and for Windows named pipes, see
-// node-tls-namedpipes.test.ts).
+// wrapped socket or pile up in its readable buffer. Covered: adopting the fd
+// right away, adopting it once plaintext still queued on the socket has been
+// flushed (like node, no TLS record may overtake it), and TLS over TLS, where
+// the TLS engine runs over the outer stream (Windows named pipes, the other
+// stream-level case, are in node-tls-namedpipes.test.ts).
 // https://github.com/oven-sh/bun/issues/32239
 // https://github.com/oven-sh/bun/issues/32242
 
@@ -174,9 +175,9 @@ test.concurrent.each([
       new Promise<string>(resolve => socket.write("STARTTLS", () => resolve(upgrade()))),
   ],
   [
-    "stream-level engine",
-    // STARTTLS is still corked when tls.connect runs (an unflushed write), which
-    // selects the stream-level engine; its ClientHello queues up behind it.
+    "fd adoption behind a pending write",
+    // STARTTLS is still corked when tls.connect runs: the fd is adopted once it
+    // has been flushed, and the ClientHello goes out behind it.
     (socket: net.Socket, upgrade: () => Promise<string>) => {
       socket.cork();
       socket.write("STARTTLS");
@@ -202,10 +203,199 @@ test.concurrent.each([
   }
 });
 
-test.concurrent("stream-level upgrade of a setEncoding() socket with buffered input reports an error", async () => {
-  // Bytes buffered on a setEncoding() socket are strings, which the engine
-  // rejects. They are handed over once tls.connect() has returned, so that
-  // rejection reaches the TLS socket's listeners instead of stalling it.
+test.concurrent("tls.connect({ socket }) behind a write under backpressure: the plaintext goes out first", async () => {
+  // Not corked but genuinely stuck behind the kernel: the ClientHello must
+  // still not overtake a single plaintext byte (node queues the TLS output
+  // behind the previous owner's writes). The plaintext is all 0x61 and a TLS
+  // record starts with 0x16, so the server takes plaintext up to the first
+  // 0x16 and wraps there; a byte out of order shortens that count or breaks
+  // the handshake.
+  const { promise: failure, reject } = Promise.withResolvers<never>();
+  const { promise: plaintextSeen, resolve: sawPlaintext } = Promise.withResolvers<number>();
+  const CHUNK = 1024 * 1024;
+  using server = await listenTCP(accepted => {
+    accepted.on("error", reject);
+    let seen = 0;
+    accepted.on("readable", function onReadable() {
+      let chunk: Buffer | null;
+      while ((chunk = accepted.read()) !== null) {
+        const end = chunk.indexOf(0x16);
+        if (end === -1) {
+          seen += chunk.length;
+          continue;
+        }
+        seen += end;
+        accepted.off("readable", onReadable);
+        accepted.unshift(chunk.subarray(end));
+        sawPlaintext(seen);
+        wrapAndEcho(accepted, reject);
+        return;
+      }
+    });
+  });
+
+  const socket = net.connect(server.port, "127.0.0.1");
+  try {
+    socket.on("error", reject);
+    await Promise.race([once(socket, "connect"), failure]);
+    // 1 MiB chunks until one does not go out synchronously (bounded).
+    let chunks = 0;
+    let backpressure = false;
+    do {
+      backpressure = !socket.write(Buffer.alloc(CHUNK, 0x61));
+      chunks++;
+    } while (!backpressure && chunks < 256);
+    expect(backpressure).toBe(true);
+    const echoed = await Promise.race([pingOverTLS(socket, reject), failure]);
+    expect({ echoed, plaintext: await plaintextSeen }).toEqual({ echoed: "ping", plaintext: chunks * CHUNK });
+  } finally {
+    socket.destroy();
+  }
+});
+
+test.concurrent(
+  "new TLSSocket(accepted, { isServer: true }) behind a pending write keeps bytes that arrive meanwhile for the TLS layer",
+  async () => {
+    // The server wraps while PROCEED is still corked, in flowing mode with its
+    // command listener attached; the client then sends a TLS record and, once
+    // that write has completed, has the server uncork. So the record reaches
+    // the server while its reads are held: it must wait in the kernel for the
+    // TLS layer (which rejects it: it is garbage) rather than be emitted to the
+    // command listener or dropped.
+    const { promise: failure, reject } = Promise.withResolvers<never>();
+    const { promise: wrappedOnServer, resolve: wrapped } = Promise.withResolvers<() => void>();
+    const { promise: outcome, resolve } = Promise.withResolvers<{
+      tlsLayerSawIt: boolean;
+      emitted: number;
+      buffered: number;
+    }>();
+    using server = await listenTCP(accepted => {
+      accepted.on("error", reject);
+      accepted.on("data", function onCommand(command) {
+        if (command.toString("latin1") !== "STARTTLS") {
+          reject(new Error(`unexpected plaintext ${JSON.stringify(command.toString("latin1"))}`));
+          return;
+        }
+        accepted.off("data", onCommand);
+        accepted.cork();
+        accepted.write("PROCEED");
+        const secure = new tls.TLSSocket(accepted, { isServer: true, ...serverTLS });
+        const surfaced = watchSurfacing(accepted);
+        secure.on("error", () => resolve({ tlsLayerSawIt: true, ...surfaced() }));
+        wrapped(() => accepted.uncork());
+      });
+    });
+
+    const socket = net.connect(server.port, "127.0.0.1");
+    try {
+      socket.on("error", reject);
+      await Promise.race([once(socket, "connect"), failure]);
+      socket.write("STARTTLS");
+      const uncorkServer = await Promise.race([wrappedOnServer, failure]);
+      // A TLS-record-shaped blob no server accepts. Loopback: once the write
+      // has completed the bytes are in the server's receive queue.
+      await new Promise<void>(done =>
+        socket.write(Buffer.from([0x16, 0x03, 0x01, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef]), () => done()),
+      );
+      uncorkServer();
+      expect(await Promise.race([outcome, failure])).toEqual({ tlsLayerSawIt: true, emitted: 0, buffered: 0 });
+    } finally {
+      socket.destroy();
+    }
+  },
+);
+
+test.concurrent(
+  "new TLSSocket(accepted, { isServer: true }) hands over a ClientHello buffered in several chunks",
+  async () => {
+    // Protocol sniffing: peek at the first byte with read(1) and unshift it back,
+    // which leaves the ClientHello in the readable buffer as two chunks. Both
+    // belong to the TLS layer (node's initRead drains the whole buffer).
+    const { promise: failure, reject } = Promise.withResolvers<never>();
+    using server = await listenTCP(accepted => {
+      accepted.on("error", reject);
+      accepted.once("readable", () => {
+        const first = accepted.read(1);
+        accepted.unshift(first);
+        if (first[0] !== 0x16) {
+          reject(new Error(`not a TLS record: ${first[0]}`));
+          return;
+        }
+        wrapAndEcho(accepted, reject);
+      });
+    });
+
+    const socket = net.connect(server.port, "127.0.0.1");
+    try {
+      socket.on("error", reject);
+      await Promise.race([once(socket, "connect"), failure]);
+      expect(await Promise.race([pingOverTLS(socket, reject), failure])).toBe("ping");
+    } finally {
+      socket.destroy();
+    }
+  },
+);
+
+test.concurrent("destroying the TLS socket while the wrapped socket is still flushing closes both", async () => {
+  // The fd is adopted once the pending plaintext has flushed; a destroy()
+  // before that must not leave the wrapped socket half-alive (reads held,
+  // never closing). Node tears the wrapped socket down with the TLS socket.
+  const { promise: failure, reject } = Promise.withResolvers<never>();
+  using server = await listenTCP(accepted => {
+    accepted.on("error", () => {});
+    accepted.resume();
+  });
+  const socket = net.connect(server.port, "127.0.0.1");
+  socket.on("error", reject);
+  await Promise.race([once(socket, "connect"), failure]);
+  socket.cork();
+  socket.write("plaintext");
+  const tlsSocket = tls.connect({ socket, ...clientTLS });
+  tlsSocket.on("error", () => {});
+  tlsSocket.destroy();
+  socket.uncork();
+  await Promise.race([once(socket, "close"), failure]);
+  expect(socket.destroyed).toBe(true);
+});
+
+test.concurrent("end() right after tls.connect({ socket }) over a flushing socket still reaches the peer", async () => {
+  // The TLS socket has no handle yet while the wrapped socket flushes; end()
+  // must wait for it (handshake, close_notify, FIN) instead of finishing as if
+  // there were nothing to close.
+  const { promise: failure, reject } = Promise.withResolvers<never>();
+  const { promise: serverSawEnd, resolve } = Promise.withResolvers<string>();
+  using server = await listenTCP(accepted => {
+    accepted.on("error", reject);
+    accepted.once("data", plaintext => {
+      accepted.pause();
+      if (plaintext.length > 9) accepted.unshift(plaintext.subarray(9));
+      const secure = new tls.TLSSocket(accepted, { isServer: true, ...serverTLS });
+      secure.on("error", reject);
+      secure.resume();
+      secure.on("end", () => resolve(plaintext.toString("latin1", 0, 9)));
+    });
+  });
+  const socket = net.connect(server.port, "127.0.0.1");
+  try {
+    socket.on("error", reject);
+    await Promise.race([once(socket, "connect"), failure]);
+    socket.cork();
+    socket.write("plaintext");
+    const tlsSocket = tls.connect({ socket, ...clientTLS });
+    tlsSocket.on("error", reject);
+    tlsSocket.end();
+    socket.uncork();
+    expect(await Promise.race([serverSawEnd, failure])).toBe("plaintext");
+  } finally {
+    socket.destroy();
+  }
+});
+
+test.concurrent("upgrading a setEncoding() socket with buffered input reports ERR_STREAM_WRAP", async () => {
+  // What the socket already buffered has to be handed to the TLS layer, and on
+  // a setEncoding() socket that is a string: not bytes anymore. Node's
+  // JSStreamSocket code for this is ERR_STREAM_WRAP; it must reach the TLS
+  // socket's listeners rather than stall the handshake or throw out of band.
   const { promise: outcome, resolve } = Promise.withResolvers<string>();
   using server = await listenTCP(accepted => {
     accepted.on("error", () => {});
@@ -221,10 +411,10 @@ test.concurrent("stream-level upgrade of a setEncoding() socket with buffered in
     socket.cork();
     socket.write("STARTTLS");
     const tlsSocket = tls.connect({ socket, ...clientTLS });
-    tlsSocket.on("error", err => resolve(err instanceof Error ? "error" : `error event with ${typeof err}`));
+    tlsSocket.on("error", err => resolve((err as NodeJS.ErrnoException)?.code ?? String(err)));
     tlsSocket.on("secureConnect", () => resolve("secureConnect"));
     socket.uncork();
-    expect(await outcome).toBe("error");
+    expect(await outcome).toBe("ERR_STREAM_WRAP");
   } finally {
     socket.destroy();
   }
@@ -274,9 +464,9 @@ test.concurrent.each([
     },
   ],
   [
-    "stream-level engine",
-    // PROCEED is still corked when the wrap runs (an unflushed write), which
-    // selects the stream-level engine right away.
+    "fd adoption behind a pending write",
+    // PROCEED is still corked when the wrap runs: the fd is adopted once it has
+    // been flushed.
     (accepted: net.Socket, wrap: () => void) => {
       accepted.cork();
       accepted.write("PROCEED");
@@ -285,7 +475,7 @@ test.concurrent.each([
     },
   ],
   [
-    "stream-level engine selected a tick after the wrap",
+    "fd adoption behind a write issued right after the wrap",
     // Nothing is pending when the wrap runs; the write queued right behind it
     // is what the wrap's deferred step finds. Uncorked once that step has run.
     (accepted: net.Socket, wrap: () => void) => {
