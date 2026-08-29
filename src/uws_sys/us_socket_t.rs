@@ -310,10 +310,15 @@ impl us_socket_t {
         c::us_socket_start_tls_handshake(self);
     }
 
-    /// No TLS output until `start_tls_handshake` (the previous owner still
-    /// has plaintext queued for this fd); inbound bytes are dispatched raw.
-    pub fn hold_tls_handshake(&mut self) {
-        c::us_socket_hold_tls_handshake(self);
+    /// Keep SSL's output back (the previous owner still has plaintext queued
+    /// for this fd) until `release_tls_output`; input is processed normally.
+    pub fn hold_tls_output(&mut self) {
+        c::us_socket_hold_tls_output(self);
+    }
+
+    /// Flush what `hold_tls_output` kept back and carry on.
+    pub fn release_tls_output(&mut self) {
+        c::us_socket_release_tls_output(self);
     }
 
     /// Feed bytes that were already read off the wire (e.g. a ClientHello the
@@ -607,7 +612,8 @@ mod c {
             length: i32,
         ) -> *mut us_socket_t;
         pub(super) safe fn us_socket_start_tls_handshake(s: &mut us_socket_t);
-        pub(super) safe fn us_socket_hold_tls_handshake(s: &mut us_socket_t);
+        pub(super) safe fn us_socket_hold_tls_output(s: &mut us_socket_t);
+        pub(super) safe fn us_socket_release_tls_output(s: &mut us_socket_t);
     }
 }
 

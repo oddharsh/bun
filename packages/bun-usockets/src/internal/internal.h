@@ -316,10 +316,8 @@ struct us_socket_t {
    * the driver's epilogue via ssl_pending_detach. */
   unsigned char ssl_in_use : 1;
   unsigned char ssl_pending_detach : 1;
-  /* Adopted into TLS while the previous owner still has plaintext queued
-   * (node's wrapHasActiveWriteFromPrevOwner): until
-   * us_socket_start_tls_handshake() SSL_write produces nothing and inbound
-   * bytes are dispatched raw (us_dispatch_data) for the owner to keep. */
+  /* us_socket_hold_tls_output .. us_socket_release_tls_output: SSL's output
+   * is buffered (us_ssl_held_output) instead of written. */
   unsigned char ssl_handshake_held : 1;
   /* Peer FIN was dispatched as on_end on a half-open socket; readable interest is never re-added and on_end never re-fires. */
   unsigned char read_eof : 1;

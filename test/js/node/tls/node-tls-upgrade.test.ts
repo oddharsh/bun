@@ -476,48 +476,137 @@ test.concurrent("a peer that closes while the handshake is held behind stuck pla
 });
 
 test.concurrent(
-  "a peer that floods while the handshake is held behind stuck plaintext is flow-controlled",
+  "a peer that sends garbage while the handshake is held behind stuck plaintext is rejected at once",
   async () => {
-    // While the handshake is held (here: forever, the wrapped socket stays
-    // corked), inbound bytes are kept for the TLS layer, but only a little —
-    // nothing legitimate precedes a ClientHello/ServerHello; beyond that the
-    // peer runs into TCP backpressure rather than our memory. The client runs in
-    // its own process so its RSS is its own; growth is sampled until it settles.
-    const FLOOD = 64 * 1024 * 1024;
+    // Only TLS *output* is held (node's has_active_write_issued_by_prev_listener_);
+    // input still reaches the TLS layer. So a peer that never drains our
+    // plaintext (the hold never ends) but sends something that is not TLS gets
+    // the same immediate protocol error as without a hold, instead of being
+    // buffered or ignored.
+    const { promise: failure, reject } = Promise.withResolvers<never>();
+    const { promise: outcome, resolve } = Promise.withResolvers<string>();
     using server = await listenTCP(accepted => {
       accepted.on("error", () => {});
-      for (let sent = 0; sent < FLOOD; sent += 1024 * 1024) accepted.write(Buffer.alloc(1024 * 1024, 0x62));
+      accepted.pause();
+      accepted.write("HTTP/1.1 400 Bad Request\r\n\r\n");
     });
-    await using proc = Bun.spawn({
-      cmd: [
-        bunExe(),
-        "-e",
-        `const net = require("net"), tls = require("tls");
-       const socket = net.connect(${server.port}, "127.0.0.1", async () => {
-         const before = process.memoryUsage.rss();
-         socket.cork();
-         socket.write("STARTTLS");
-         tls.connect({ socket, rejectUnauthorized: false }).on("error", () => {});
-         let last = before, grown = 0;
-         for (let i = 0; i < 30; i++) {
-           await new Promise(r => setTimeout(r, 100));
-           const now = process.memoryUsage.rss();
-           grown = now - before;
-           if (i >= 5 && Math.abs(now - last) < (1 << 20)) break;
-           last = now;
-         }
-         console.log(grown < ${FLOOD / 2} ? "bounded" : "grew " + grown);
-         process.exit(0);
-       });`,
-      ],
-      env: bunEnv,
-      stdout: "pipe",
-      stderr: "inherit",
-    });
-    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
-    expect({ stdout: stdout.trim(), exitCode }).toEqual({ stdout: "bounded", exitCode: 0 });
+    const socket = net.connect(server.port, "127.0.0.1");
+    try {
+      socket.on("error", () => {});
+      await Promise.race([once(socket, "connect"), failure]);
+      socket.cork();
+      socket.write("STARTTLS"); // stays queued: the handshake output is held for good
+      const tlsSocket = tls.connect({ socket, ...clientTLS });
+      tlsSocket.on("error", err => resolve((err as NodeJS.ErrnoException).code ?? err.message));
+      tlsSocket.on("secureConnect", () => resolve("secureConnect"));
+      expect(await Promise.race([outcome, failure])).toMatch(/^ERR_SSL_|WRONG_VERSION_NUMBER/);
+    } finally {
+      socket.destroy();
+    }
   },
 );
+
+test.concurrent("tls.connect over a generic Duplex with a write still pending is not held up", async () => {
+  // A plain Duplex transport orders our records behind its own pending writes
+  // by itself; nothing must wait for a release that never comes.
+  const { promise: failure, reject } = Promise.withResolvers<never>();
+  const server = tls.createServer(serverTLS, secure => {
+    secure.on("error", reject);
+    secure.on("data", d => secure.write(d));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const raw = net.connect((server.address() as net.AddressInfo).port, "127.0.0.1");
+  try {
+    raw.on("error", reject);
+    await Promise.race([once(raw, "connect"), failure]);
+    const { Duplex } = require("node:stream");
+    const duplex = new Duplex({
+      read() {},
+      write(chunk, _enc, cb) {
+        raw.write(chunk, cb); // async completion: writableLength > 0 meanwhile
+      },
+      final(cb) {
+        raw.end(cb);
+      },
+    });
+    raw.on("data", chunk => duplex.push(chunk));
+    raw.on("end", () => duplex.push(null));
+    duplex.write(Buffer.alloc(0)); // a write in flight when the wrap happens
+    const echoed = await Promise.race([pingOverTLS(duplex as unknown as net.Socket, reject), failure]);
+    expect(echoed).toBe("ping");
+  } finally {
+    raw.destroy();
+    server.close();
+  }
+});
+
+test.concurrent("TLS over TLS: ending right after a large inner write still delivers all of it", async () => {
+  // The inner layer's ciphertext goes into the outer socket natively; an
+  // end() on the outer stream must queue its FIN behind what is still parked
+  // there rather than cut it off.
+  const TOTAL = 4 * 1024 * 1024;
+  const { promise: failure, reject } = Promise.withResolvers<never>();
+  const { promise: received, resolve } = Promise.withResolvers<number>();
+  const outerServer = tls.createServer(serverTLS, outer => {
+    outer.on("error", reject);
+    const inner = new tls.TLSSocket(outer, { isServer: true, ...serverTLS });
+    inner.on("error", reject);
+    let got = 0;
+    inner.on("data", chunk => (got += chunk.length));
+    inner.on("end", () => resolve(got));
+  });
+  outerServer.listen(0, "127.0.0.1");
+  await once(outerServer, "listening");
+  const outer = tls.connect({ port: (outerServer.address() as net.AddressInfo).port, host: "127.0.0.1", ...clientTLS });
+  try {
+    outer.on("error", reject);
+    await Promise.race([once(outer, "secureConnect"), failure]);
+    const inner = tls.connect({ socket: outer, ...clientTLS });
+    inner.on("error", reject);
+    await Promise.race([once(inner, "secureConnect"), failure]);
+    inner.end(Buffer.alloc(TOTAL, 0x61), () => outer.end());
+    expect(await Promise.race([received, failure])).toBe(TOTAL);
+  } finally {
+    outer.destroy();
+    outerServer.close();
+  }
+});
+
+test.concurrent("TLS over TLS behind a pending outer write: the inner ClientHello goes out after it", async () => {
+  // Stream-level engine with native output: the inner layer's records must
+  // queue behind plaintext the outer TLS socket still has in its Writable, as
+  // node's inner TLSWrap does over the outer one.
+  const { promise: failure, reject } = Promise.withResolvers<never>();
+  const outerServer = tls.createServer(serverTLS, outer => {
+    outer.on("error", reject);
+    outer.once("data", chunk => {
+      // STARTTLS first; the ClientHello may ride in the same chunk behind it.
+      if (chunk.toString("latin1", 0, 8) !== "STARTTLS") {
+        reject(new Error(`unexpected plaintext ${JSON.stringify(chunk.toString("latin1"))}`));
+        return;
+      }
+      outer.pause();
+      if (chunk.length > 8) outer.unshift(chunk.subarray(8));
+      wrapAndEcho(outer, reject);
+    });
+  });
+  outerServer.listen(0, "127.0.0.1");
+  await once(outerServer, "listening");
+  const outer = tls.connect({ port: (outerServer.address() as net.AddressInfo).port, host: "127.0.0.1", ...clientTLS });
+  try {
+    outer.on("error", reject);
+    await Promise.race([once(outer, "secureConnect"), failure]);
+    outer.cork();
+    outer.write("STARTTLS");
+    const echoed = pingOverTLS(outer as unknown as net.Socket, reject);
+    outer.uncork();
+    expect(await Promise.race([echoed, failure])).toBe("ping");
+  } finally {
+    outer.destroy();
+    outerServer.close();
+  }
+});
 
 test.concurrent(
   "a socket sniffed with once('data') + unshift() still hands its ClientHello to a stream-level TLS layer",

@@ -325,8 +325,6 @@ pub struct NewSocket<const SSL: bool> {
     pub(crate) protos: JsCell<Option<Box<[u8]>>>,
     pub(crate) server_name: JsCell<Option<Box<[u8]>>>,
     pub(crate) buffered_data_for_node_net: JsCell<Vec<u8>>,
-    /// Ciphertext that arrived while `HANDSHAKE_HELD`; fed at `startTLSHandshake`.
-    pub(crate) held_input: JsCell<Vec<u8>>,
     pub(crate) bytes_written: Cell<u64>,
 
     pub(crate) native_callback: JsCell<NativeCallbacks>,
@@ -555,7 +553,6 @@ impl<const SSL: bool> NewSocket<SSL> {
         let ssl_cost: usize = if SSL { 40 * 1024 } else { 0 };
         core::mem::size_of::<Self>()
             + self.buffered_data_for_node_net.get().capacity() as usize
-            + self.held_input.get().capacity() as usize
             + ssl_cost
     }
 
@@ -566,6 +563,33 @@ impl<const SSL: bool> NewSocket<SSL> {
         }
         self.native_callback.set(callback);
         true
+    }
+
+    /// Ciphertext from the stream-level TLS engine this socket transports;
+    /// queued behind whatever node:net still had buffered here.
+    pub(crate) fn write_from_engine(&self, data: &[u8]) {
+        let socket = self.socket.get();
+        if socket.is_detached() || socket.is_closed() || socket.is_shutdown() {
+            return;
+        }
+        if self.buffered_data_for_node_net.get().is_empty() {
+            let wrote = self.write_maybe_corked(data);
+            if wrote < 0 {
+                return;
+            }
+            let wrote = usize::try_from(wrote).expect("int cast");
+            if wrote < data.len() {
+                self.buffered_data_for_node_net
+                    .with_mut(|b| b.extend_from_slice(&data[wrote..]));
+                if !self.poll_ref.get().is_active() {
+                    self.update_flags(|f| f.insert(Flags::ENGINE_OUTPUT_HOLD));
+                    self.poll_ref.with_mut(|p| p.ref_(js_loop_ctx()));
+                }
+            }
+        } else {
+            self.buffered_data_for_node_net
+                .with_mut(|b| b.extend_from_slice(data));
+        }
     }
 
     /// This socket is going away under whatever consumed it natively.
@@ -726,10 +750,6 @@ impl<const SSL: bool> NewSocket<SSL> {
     }
 
     pub(crate) fn resume_reads(&self) {
-        // `held_input` is full: reads come back with `startTLSHandshake`.
-        if self.flags.get().contains(Flags::HELD_INPUT_FULL) {
-            return;
-        }
         if self.flags.get().contains(Flags::IS_PAUSED) {
             let resumed = self.socket.get().resume_stream();
             self.update_flags(|f| f.set(Flags::IS_PAUSED, !resumed));
@@ -743,34 +763,25 @@ impl<const SSL: bool> NewSocket<SSL> {
         Ok(JSValue::from(this.flags.get().contains(Flags::BYPASS_TLS)))
     }
 
-    /// See `Flags::HANDSHAKE_HELD`. `initialData`: what the previous owner had
-    /// already read off the wire (a ClientHello), fed as if it just arrived.
+    /// node:net: the wrapped socket's queued plaintext is out; let the TLS
+    /// output held behind it (`deferHandshake`) go.
     #[bun_jsc::host_fn(method)]
     pub(crate) fn start_tls_handshake(
         this: &Self,
-        global: &JSGlobalObject,
-        frame: &CallFrame,
+        _global: &JSGlobalObject,
+        _frame: &CallFrame,
     ) -> JsResult<JSValue> {
-        let initial_data = bytes_from_js(global, frame.argument(0))?;
-        if !this.flags.get().contains(Flags::HANDSHAKE_HELD) {
-            return Ok(JSValue::UNDEFINED);
-        }
-        this.update_flags(|f| f.remove(Flags::HANDSHAKE_HELD));
-        let uws::InternalSocket::Connected(s) = this.socket.get().socket else {
-            return Ok(JSValue::UNDEFINED);
-        };
-        let held = this.held_input.replace(Vec::new());
-        if this.flags.get().contains(Flags::HELD_INPUT_FULL) {
-            this.update_flags(|f| f.remove(Flags::HELD_INPUT_FULL));
-            this.resume_reads();
-        }
         let _keep = this.ref_guard();
-        // S008: `us_socket_t` is an `opaque_ffi!` ZST — safe deref.
-        bun_opaque::opaque_deref_mut(s).start_tls_handshake();
-        for early in [&initial_data, &held] {
-            if !early.is_empty() && !this.socket.get().is_detached() {
-                bun_opaque::opaque_deref_mut(s).tls_feed(early);
+        match this.socket.get().socket {
+            // S008: `us_socket_t` is an `opaque_ffi!` ZST — safe deref.
+            uws::InternalSocket::Connected(s) => {
+                bun_opaque::opaque_deref_mut(s).release_tls_output()
             }
+            // SAFETY: same allocation, runtime-side type (uws_sys shim).
+            uws::InternalSocket::UpgradedDuplex(d) => {
+                unsafe { &*d.cast::<UpgradedDuplex>() }.release_output()
+            }
+            _ => {}
         }
         Ok(JSValue::UNDEFINED)
     }
@@ -1001,6 +1012,10 @@ impl<const SSL: bool> NewSocket<SSL> {
             }
         }
         if this.native_callback.get().on_writable() {
+            return Ok(());
+        }
+        // (A `TlsTransport` engine ran JS there, which may have closed us.)
+        if !this.has_handlers() || this.socket.get().is_detached() {
             return Ok(());
         }
         let handlers = this.get_handlers();
@@ -2311,17 +2326,6 @@ impl<const SSL: bool> NewSocket<SSL> {
         if this.socket.get().is_detached() {
             return Ok(());
         }
-        if SSL && this.flags.get().contains(Flags::HANDSHAKE_HELD) {
-            // Nothing legitimate is large here (at most a ClientHello); past the
-            // cap the rest waits in the kernel.
-            const HELD_INPUT_MAX: usize = 64 * 1024;
-            this.held_input.with_mut(|h| h.extend_from_slice(data));
-            if this.held_input.get().len() >= HELD_INPUT_MAX {
-                this.update_flags(|f| f.insert(Flags::HELD_INPUT_FULL));
-                this.pause_reads();
-            }
-            return Ok(());
-        }
         if this.native_callback.get().on_data(data)? {
             return Ok(());
         }
@@ -3212,6 +3216,17 @@ impl<const SSL: bool> NewSocket<SSL> {
         let _ = self.try_write_empty_packet();
         self.socket.get().flush();
 
+        if self.buffered_data_for_node_net.get().is_empty() {
+            let flags = self.flags.get();
+            if flags.contains(Flags::ENGINE_OUTPUT_HOLD) {
+                self.update_flags(|f| f.remove(Flags::ENGINE_OUTPUT_HOLD));
+                self.poll_ref.with_mut(|p| p.unref(js_loop_ctx()));
+            }
+            if flags.contains(Flags::SHUTDOWN_AFTER_FLUSH) {
+                self.update_flags(|f| f.remove(Flags::SHUTDOWN_AFTER_FLUSH));
+                self.socket.get().shutdown();
+            }
+        }
         if self.can_end_after_flush() {
             self.mark_inactive();
         }
@@ -3276,6 +3291,8 @@ impl<const SSL: bool> NewSocket<SSL> {
         let [arg] = callframe.arguments_as_array::<1>();
         if callframe.arguments_count() > 0 && arg.to_boolean() {
             this.socket.get().shutdown_read();
+        } else if !this.buffered_data_for_node_net.get().is_empty() {
+            this.update_flags(|f| f.insert(Flags::SHUTDOWN_AFTER_FLUSH));
         } else {
             this.socket.get().shutdown();
         }
@@ -3372,6 +3389,7 @@ impl<const SSL: bool> NewSocket<SSL> {
         _frame: &CallFrame,
     ) -> JsResult<JSValue> {
         jsc::mark_binding!();
+        this.update_flags(|f| f.remove(Flags::ENGINE_OUTPUT_HOLD));
         if this.socket.get().is_established() {
             this.poll_ref.with_mut(|p| p.ref_(js_loop_ctx()));
         } else {
@@ -3388,6 +3406,7 @@ impl<const SSL: bool> NewSocket<SSL> {
         _frame: &CallFrame,
     ) -> JsResult<JSValue> {
         jsc::mark_binding!();
+        this.update_flags(|f| f.remove(Flags::ENGINE_OUTPUT_HOLD));
         if this.socket.get().is_established() {
             this.poll_ref.with_mut(|p| p.unref(js_loop_ctx()));
         } else {
@@ -3537,8 +3556,9 @@ impl<const SSL: bool> NewSocket<SSL> {
             opts.get(global, "initialData")?
                 .unwrap_or(JSValue::UNDEFINED),
         )?;
-        // node:net only: the wrapped socket still has plaintext queued, so the
-        // handshake waits for `startTLSHandshake` (see `Flags::HANDSHAKE_HELD`).
+        // node:net only: the wrapped socket still has plaintext queued, so TLS
+        // output waits for `startTLSHandshake` (node's
+        // `has_active_write_issued_by_prev_listener_`).
         let defer_handshake = for_node_net
             && opts
                 .get_truthy(global, "deferHandshake")?
@@ -3664,7 +3684,6 @@ impl<const SSL: bool> NewSocket<SSL> {
         let mut initial_flags = Flags::initial(reject_unauthorized);
         initial_flags.set(Flags::DEFERS_SERVER_IDENTITY, for_node_net);
         initial_flags.set(Flags::TLS_SERVER_ROLE, is_server);
-        initial_flags.set(Flags::HANDSHAKE_HELD, defer_handshake);
         let tls: bun_ptr::ThisPtr<TLSSocket> = TLSSocket::new(TLSSocket {
             ref_count: bun_ptr::RefCount::init(),
             handlers: JsCell::new(Some(handlers)),
@@ -3681,7 +3700,6 @@ impl<const SSL: bool> NewSocket<SSL> {
             poll_ref: JsCell::new(KeepAlive::init()),
             ref_pollref_on_connect: Cell::new(true),
             buffered_data_for_node_net: JsCell::new(Vec::new()),
-            held_input: JsCell::new(Vec::new()),
             bytes_written: Cell::new(0),
             native_callback: JsCell::new(NativeCallbacks::None),
             twin: JsCell::new(None),
@@ -3778,14 +3796,10 @@ impl<const SSL: bool> NewSocket<SSL> {
         // What settling in the new socket's `on_open` left pending (a
         // terminating VM) is not run over: the handshake re-enters JS.
         if defer_handshake {
-            bun_opaque::opaque_deref_mut(new_raw.as_ptr()).hold_tls_handshake();
+            bun_opaque::opaque_deref_mut(new_raw.as_ptr()).hold_tls_output();
         }
         TLSSocket::on_open(tls, tls.socket.get())?;
-        if tls.socket.get().is_detached() {
-            // closed from `onOpen`
-        } else if defer_handshake {
-            bun_opaque::opaque_deref_mut(new_raw.as_ptr()).resume();
-        } else {
+        if !tls.socket.get().is_detached() {
             bun_opaque::opaque_deref_mut(new_raw.as_ptr()).start_tls_handshake();
             // The socket being wrapped may have had its readable interest off (an
             // accepted socket nobody was reading yet — its ClientHello is still in
@@ -4166,8 +4180,15 @@ impl NativeCallbacks {
     pub(crate) fn on_writable(&self) -> bool {
         let h2 = match self {
             NativeCallbacks::H2(h2) => h2.as_ptr(),
-            // The engine writes through the JS stream, whose `drain` is JS's.
-            NativeCallbacks::TlsTransport(_) | NativeCallbacks::None => return false,
+            NativeCallbacks::TlsTransport(inner) => {
+                if let Some(engine) = Self::engine(inner) {
+                    let _keep = inner.clone();
+                    engine.on_transport_writable();
+                }
+                // node:net's own drain handler still runs for the wrapped socket.
+                return false;
+            }
+            NativeCallbacks::None => return false,
         };
         // SAFETY: `on_native_writable` takes a keepalive; `h2` stays live across re-entry.
         unsafe { (*h2).on_native_writable() };
@@ -4271,12 +4292,13 @@ bitflags::bitflags! {
         const TLS_SERVER_ROLE      = 1 << 14;
         /// node:net's `pauseOnConnect`: paused in `on_open` (plain; free for a socket that was registered with `LIBUS_SOCKET_OPEN_PAUSED`) or after the handshake (TLS).
         const PAUSE_ON_CONNECT     = 1 << 15;
-        /// Adopted into TLS behind the previous owner's queued plaintext (node's
-        /// `wrapHasActiveWriteFromPrevOwner`): until `startTLSHandshake` uSockets
-        /// emits no TLS and hands inbound bytes over raw (kept in `held_input`).
-        const HANDSHAKE_HELD       = 1 << 16;
-        /// `held_input` reached its cap and paused reads; `startTLSHandshake` resumes.
-        const HELD_INPUT_FULL      = 1 << 17;
+        /// `shutdown()` arrived with bytes still in `buffered_data_for_node_net`
+        /// (a stream-level TLS engine's tail): the FIN follows them.
+        const SHUTDOWN_AFTER_FLUSH = 1 << 16;
+        /// We took a loop ref for a stream-level TLS engine's parked output on
+        /// an otherwise unref'd socket (node: a uv write req holds the loop);
+        /// dropped when it drains or JS ref()/unref()s.
+        const ENGINE_OUTPUT_HOLD   = 1 << 17;
     }
 }
 
@@ -4813,6 +4835,11 @@ pub fn js_upgrade_duplex_to_tls(
     let transport = opts
         .get_truthy(global, "transport")?
         .unwrap_or(JSValue::UNDEFINED);
+    // A handle-backed transport still has plaintext queued in JS: hold our
+    // output until `startTLSHandshake`.
+    let defer_handshake = opts
+        .get_truthy(global, "deferHandshake")?
+        .is_some_and(|v| v.to_boolean());
 
     let reject_unauthorized = upgrade_reject_policy(
         handlers.vm,
@@ -4858,7 +4885,6 @@ pub fn js_upgrade_duplex_to_tls(
         poll_ref: JsCell::new(KeepAlive::init()),
         ref_pollref_on_connect: Cell::new(true),
         buffered_data_for_node_net: JsCell::new(Vec::new()),
-        held_input: JsCell::new(Vec::new()),
         bytes_written: Cell::new(0),
         native_callback: JsCell::new(NativeCallbacks::None),
         twin: JsCell::new(None),
@@ -5009,6 +5035,9 @@ pub fn js_upgrade_duplex_to_tls(
         .upgrade
         .transport
         .set(linked.unwrap_or(Transport::None));
+    if defer_handshake && duplex_context_ref.upgrade.has_transport() {
+        duplex_context_ref.upgrade.held_output.set(Some(Vec::new()));
+    }
 
     let array = JSValue::create_empty_array(global, 2)?;
     array.put_index(global, 0, tls_js_value)?;

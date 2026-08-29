@@ -1935,7 +1935,7 @@ function adoptConnection(self, connection, data, handlers, isServer, tls) {
     socket: handlers,
     isServer,
     deferHandshake,
-    initialData: deferHandshake ? undefined : pending,
+    initialData: pending,
   });
   if (!result) {
     self._handle = null;
@@ -1947,7 +1947,7 @@ function adoptConnection(self, connection, data, handlers, isServer, tls) {
   if (deferHandshake) {
     connection.write("", err => {
       // On failure `connection` is erroring/closing, and `self` with it.
-      if (!err && self._handle === tlsHandle && !connection.destroyed) tlsHandle.startTLSHandshake(pending);
+      if (!err && self._handle === tlsHandle && !connection.destroyed) tlsHandle.startTLSHandshake();
     });
   }
   return true;
@@ -1958,7 +1958,12 @@ function upgradeClientConnection(self, connection, overStream, tls) {
   self[kupgraded] = connection;
   const data = { self, req: { oncomplete: afterConnect } };
   if (overStream) {
-    self._handle = upgradeStreamToTLS(self, connection, { data, tls, socket: self[khandlers] })[0];
+    self._handle = upgradeStreamToTLS(self, connection, {
+      data,
+      tls,
+      socket: self[khandlers],
+      deferHandshake: hasUnflushedWrites(connection),
+    })[0];
     return;
   }
   adoptConnection(self, connection, data, self[khandlers], false, tls);
@@ -2388,6 +2393,7 @@ Socket.prototype[Symbol.for("::bunUpgradeServerTLS::")] = function (connection, 
       tls,
       socket: serverHandlersFor(this),
       isServer: true,
+      deferHandshake: hasUnflushedWrites(connection),
     })[0];
     return;
   }

@@ -180,6 +180,8 @@ static int us_ssl_socket_sni_ex_idx = -1;
  * owned by other engines (the JS-stream SSL wrapper used for TLS-over-duplex)
  * whose BIOs do not point at the loop's shared BIO data. */
 static int us_ssl_is_socket_ex_idx = -1;
+/* TLS output produced while ssl_handshake_held (struct us_ssl_held_output). */
+static int us_ssl_held_output_idx = -1;
 /* (SSL) inline-reject clients: (void*)1 when the rejectUnauthorized policy
  * was installed, and the LAST X509 error recorded while walking the chain
  * (node's ssl.verifyError() verdict) as (void*)(intptr_t). */
@@ -264,6 +266,62 @@ static void us_ssl_reneg_state_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
                                     int index, long argl, void *argp) {
   (void)parent; (void)ad; (void)index; (void)argl; (void)argp;
   us_free(ptr);
+}
+
+/* What node's TLSWrap keeps in its enc_out_ BIO while
+ * has_active_write_issued_by_prev_listener_: the handshake flight (and
+ * anything else SSL emits) until the previous owner's plaintext is out. */
+struct us_ssl_held_output {
+  unsigned int len, cap, off; /* off: already written (draining after release) */
+  char data[];
+};
+
+static void us_ssl_held_output_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
+                                    int index, long argl, void *argp) {
+  (void)parent; (void)ad; (void)index; (void)argl; (void)argp;
+  us_free(ptr);
+}
+
+/* After release: write out what was held. 1 = nothing pending any more. A
+ * short write leaves the rest for the next writable event (raw_write re-arms
+ * it), ahead of anything SSL emits meanwhile (BIO_s_custom_write keeps
+ * appending while the buffer exists). */
+static int us_ssl_drain_held_output(struct us_socket_t *s) {
+  SSL *ssl = s_ssl(s);
+  struct us_ssl_held_output *held = SSL_get_ex_data(ssl, us_ssl_held_output_idx);
+  if (!held) return 1;
+  while (held->off < held->len) {
+    int written = us_socket_raw_write(s, held->data + held->off, (int)(held->len - held->off));
+    if (written <= 0) return 0;
+    held->off += (unsigned int)written;
+  }
+  SSL_set_ex_data(ssl, us_ssl_held_output_idx, NULL);
+  us_free(held);
+  return 1;
+}
+
+static int us_ssl_output_held(struct us_socket_t *s) {
+  return s->ssl_handshake_held || SSL_get_ex_data(s_ssl(s), us_ssl_held_output_idx) != NULL;
+}
+
+/* 0 on allocation failure. */
+static int us_ssl_hold_output(SSL *ssl, const char *data, unsigned int length) {
+  struct us_ssl_held_output *held = SSL_get_ex_data(ssl, us_ssl_held_output_idx);
+  unsigned int len = held ? held->len : 0;
+  if (!held || len + length > held->cap) {
+    unsigned int cap = held ? held->cap : 4096;
+    while (cap < len + length) cap *= 2;
+    struct us_ssl_held_output *grown = us_realloc(held, sizeof(*held) + cap);
+    if (!grown) return 0;
+    if (!held) grown->off = 0;
+    grown->len = len;
+    grown->cap = cap;
+    held = grown;
+    SSL_set_ex_data(ssl, us_ssl_held_output_idx, held);
+  }
+  memcpy(held->data + held->len, data, length);
+  held->len += length;
+  return 1;
 }
 
 /* A new resumable session is ready (for TLS 1.3, the peer's NewSessionTicket
@@ -456,6 +514,7 @@ static void us_ex_idx_init(void) {
   us_ssl_socket_sni_ex_idx =
       SSL_get_ex_new_index(0, NULL, NULL, NULL, us_socket_sni_resolver_free);
   us_ssl_is_socket_ex_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+  us_ssl_held_output_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, us_ssl_held_output_free);
   us_ssl_inline_reject_enabled_ex_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
   us_ssl_inline_reject_err_ex_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
   us_ssl_pending_session_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, us_ssl_pending_session_free);
@@ -675,6 +734,15 @@ static int BIO_s_custom_write(BIO *bio, const char *data, int length) {
    * (node's post-verify destroy cancels its queued Finished the same way). */
   if (loop_ssl_data->ssl_socket &&
       us_ssl_inline_reject_tripped(loop_ssl_data->ssl_socket)) {
+    BIO_clear_retry_flags(bio);
+    return length;
+  }
+
+  if (loop_ssl_data->ssl_socket && us_ssl_output_held(loop_ssl_data->ssl_socket)) {
+    struct us_socket_t *s = loop_ssl_data->ssl_socket;
+    if (!us_ssl_hold_output(s_ssl(s), data, (unsigned int)length)) {
+      s->ssl_fatal_error = 1;
+    }
     BIO_clear_retry_flags(bio);
     return length;
   }
@@ -2097,7 +2165,7 @@ static void ssl_update_handshake(struct us_socket_t *s) {
    * it; clear it before this socket's handshake step so any reason captured
    * below genuinely belongs to this socket's own failure. */
   ERR_clear_error();
-    if (!s->ssl || s->ssl_handshake_state != HANDSHAKE_PENDING || s->ssl_handshake_held) return;
+    if (!s->ssl || s->ssl_handshake_state != HANDSHAKE_PENDING) return;
 
   /* SSL_read may have driven the handshake to completion before we got here
    * (TLS 1.3 server: client's Finished + close_notify in one segment lands as
@@ -2291,8 +2359,9 @@ struct us_socket_t *us_internal_ssl_on_end(struct us_socket_t *s) {
 
 struct us_socket_t *us_internal_ssl_on_writable(struct us_socket_t *s) {
   /* Nothing of TLS is in flight yet; the event is for the previous owner's
-   * plaintext (see ssl_handshake_held). */
-  if (s->ssl_handshake_held) return us_dispatch_writable(s);
+   * plaintext (see ssl_handshake_held). Then what the hold kept back goes,
+   * before anything else of ours. */
+  if (s->ssl_handshake_held || !us_ssl_drain_held_output(s)) return us_dispatch_writable(s);
   ssl_set_loop_data(s);
   {
     struct loop_ssl_data *loop_ssl_data = (struct loop_ssl_data *)s->group->loop->data.ssl_data;
@@ -2356,8 +2425,6 @@ struct us_socket_t *us_internal_ssl_on_writable(struct us_socket_t *s) {
 }
 
 struct us_socket_t *us_internal_ssl_on_data(struct us_socket_t *s, char *data, int length) {
-  /* Not TLS's yet: the owner keeps it for us_socket_start_tls_handshake. */
-  if (s->ssl_handshake_held) return us_dispatch_data(s, data, length);
   /* See ssl_update_handshake: start this socket's SSL processing with a clean
    * per-thread error queue so a captured reason cannot belong to another
    * socket on the same thread. */
@@ -2688,9 +2755,8 @@ int us_internal_ssl_write(struct us_socket_t *s, const char *data, int length) {
   }
 
   /* Called from inside SSL_read/SSL_do_handshake on this socket (an ALPN/SNI
-   * callback writing), or the handshake is held behind the previous owner's
-   * plaintext: wait for the handshake, same as WANT_READ below. */
-  if (s->ssl_in_use || s->ssl_handshake_held) {
+   * callback writing): wait for the handshake, same as WANT_READ below. */
+  if (s->ssl_in_use) {
     s->ssl_write_wants_read = 1;
     return 0;
   }
@@ -2919,14 +2985,24 @@ struct us_socket_t *us_socket_adopt_tls(struct us_socket_t *s,
   return new_s;
 }
 
-void us_socket_hold_tls_handshake(struct us_socket_t *s) {
+void us_socket_hold_tls_output(struct us_socket_t *s) {
   if (!s->ssl || us_socket_is_closed(s)) return;
+  us_ex_idx_ensure();
   s->ssl_handshake_held = 1;
+}
+
+void us_socket_release_tls_output(struct us_socket_t *s) {
+  if (!s->ssl || us_socket_is_closed(s) || !s->ssl_handshake_held) return;
+  s->ssl_handshake_held = 0;
+  /* A JS write parked meanwhile goes out with the next writable event. */
+  s->ssl_write_wants_read = 1;
+  if (!us_ssl_drain_held_output(s) || us_socket_is_closed(s)) return;
+  ssl_set_loop_data(s);
+  ssl_update_handshake(s);
 }
 
 void us_socket_start_tls_handshake(struct us_socket_t *s) {
   if (!s->ssl || us_socket_is_closed(s)) return;
-  s->ssl_handshake_held = 0;
   ssl_set_loop_data(s);
   ssl_update_handshake(s);
 }

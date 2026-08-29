@@ -65,10 +65,13 @@ pub(crate) struct UpgradedDuplex {
     /// the original data-then-EOF order.
     pub pending_end: Cell<bool>,
     /// The handle-backed socket this engine runs over, when there is one: its
-    /// `NativeCallbacks::TlsTransport` delivers data/end/close, flow control
-    /// goes to it, and teardown hands it back. Ciphertext out (and so
-    /// `drain`) goes through the JS stream either way.
+    /// `NativeCallbacks::TlsTransport` delivers data/end/drain/close, ciphertext
+    /// goes straight into it, flow control reaches it, and teardown hands it
+    /// back. (`end()` still goes through the JS stream, which owns that state.)
     pub transport: JsCell<Transport>,
+    /// `Some` while output is held behind the transport's queued plaintext
+    /// (node's `has_active_write_issued_by_prev_listener_`); see `release_output`.
+    pub held_output: JsCell<Option<Vec<u8>>>,
 }
 
 /// See [`UpgradedDuplex::transport`].
@@ -283,13 +286,16 @@ impl UpgradedDuplex {
 
     fn write_encrypted(&self, encoded_data: &[u8]) {
         self.reset_timeout();
-
-        // Possible scenarios:
-        // Scenario 1: will not write if vm is shutting down (we cannot do anything about it)
-        // Scenario 2: will not write if a exception is thrown (will be handled by onError)
-        // Scenario 3: will be queued in memory and will be flushed later
-        // Scenario 4: no write/end function exists (will be handled by onError)
-        self.call_write_or_end(Some(encoded_data), true);
+        let held = self.held_output.with_mut(|h| match h.as_mut() {
+            Some(h) => {
+                h.extend_from_slice(encoded_data);
+                true
+            }
+            None => false,
+        });
+        if !held {
+            self.write_to_transport(encoded_data);
+        }
     }
 
     #[uws_callback(export = "UpgradedDuplex__flush")]
@@ -411,6 +417,28 @@ impl UpgradedDuplex {
             pending_data: JsCell::new(Vec::new()),
             pending_end: Cell::new(false),
             transport: JsCell::new(Transport::None),
+            held_output: JsCell::new(None),
+        }
+    }
+
+    pub(crate) fn has_transport(&self) -> bool {
+        !matches!(self.transport.get(), Transport::None)
+    }
+
+    /// The transport's queued plaintext is out: send what was held, stop holding.
+    pub(crate) fn release_output(&self) {
+        if let Some(held) = self.held_output.replace(None) {
+            if !held.is_empty() {
+                self.write_to_transport(&held);
+            }
+        }
+    }
+
+    fn write_to_transport(&self, data: &[u8]) {
+        match self.transport.get() {
+            Transport::Tcp(t) => t.write_from_engine(data),
+            Transport::Tls(t) => t.write_from_engine(data),
+            Transport::None => self.call_write_or_end(Some(data), true),
         }
     }
 
@@ -453,7 +481,7 @@ impl UpgradedDuplex {
         }
     }
 
-    /// The transport's JS `drain`.
+    /// The transport can take more (natively, or a Duplex's `drain`).
     pub(crate) fn on_transport_writable(&self) {
         self.flush();
         (self.handlers.on_writable)(self.handlers.ctx);
