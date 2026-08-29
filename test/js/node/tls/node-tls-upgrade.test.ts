@@ -478,44 +478,78 @@ test.concurrent("a peer that closes while the handshake is held behind stuck pla
 test.concurrent(
   "a peer that floods while the handshake is held behind stuck plaintext is flow-controlled",
   async () => {
-    // While the handshake is held, inbound bytes are kept for the TLS layer, but
-    // only a little (nothing legitimate precedes a ClientHello/ServerHello);
-    // beyond that the peer runs into TCP backpressure instead of our memory. The
-    // peer never reads, so the client's plaintext never flushes and the hold
-    // lasts; the peer then queues 64 MiB. Flow control shows as that queue never
-    // draining — an absence, hence the deadline poll.
-    const { promise: failure, reject } = Promise.withResolvers<never>();
-    const { promise: peerSide, resolve } = Promise.withResolvers<net.Socket>();
+    // While the handshake is held (here: forever, the wrapped socket stays
+    // corked), inbound bytes are kept for the TLS layer, but only a little —
+    // nothing legitimate precedes a ClientHello/ServerHello; beyond that the
+    // peer runs into TCP backpressure rather than our memory. The client runs in
+    // its own process so its RSS is its own; growth is sampled until it settles.
     const FLOOD = 64 * 1024 * 1024;
     using server = await listenTCP(accepted => {
       accepted.on("error", () => {});
-      accepted.pause();
       for (let sent = 0; sent < FLOOD; sent += 1024 * 1024) accepted.write(Buffer.alloc(1024 * 1024, 0x62));
-      resolve(accepted);
     });
-    const socket = net.connect(server.port, "127.0.0.1");
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `const net = require("net"), tls = require("tls");
+       const socket = net.connect(${server.port}, "127.0.0.1", async () => {
+         const before = process.memoryUsage.rss();
+         socket.cork();
+         socket.write("STARTTLS");
+         tls.connect({ socket, rejectUnauthorized: false }).on("error", () => {});
+         let last = before, grown = 0;
+         for (let i = 0; i < 30; i++) {
+           await new Promise(r => setTimeout(r, 100));
+           const now = process.memoryUsage.rss();
+           grown = now - before;
+           if (i >= 5 && Math.abs(now - last) < (1 << 20)) break;
+           last = now;
+         }
+         console.log(grown < ${FLOOD / 2} ? "bounded" : "grew " + grown);
+         process.exit(0);
+       });`,
+      ],
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "inherit",
+    });
+    const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
+    expect({ stdout: stdout.trim(), exitCode }).toEqual({ stdout: "bounded", exitCode: 0 });
+  },
+);
+
+test.concurrent(
+  "a socket sniffed with once('data') + unshift() still hands its ClientHello to a stream-level TLS layer",
+  async () => {
+    // The wrapped socket is left flowing with no 'data' listener and the
+    // ClientHello unshifted back into it; the hand-over must get those bytes
+    // before flow() throws them away. (TLS over TLS here, so the stream-level
+    // engine is used off Windows too.)
+    const { promise: failure, reject } = Promise.withResolvers<never>();
+    const outerServer = tls.createServer(serverTLS, outer => {
+      outer.on("error", reject);
+      outer.once("data", chunk => {
+        outer.unshift(chunk);
+        const inner = new tls.TLSSocket(outer, { isServer: true, ...serverTLS });
+        inner.on("error", reject);
+        inner.on("data", d => inner.write(d));
+      });
+    });
+    outerServer.listen(0, "127.0.0.1");
+    await once(outerServer, "listening");
+    const outer = tls.connect({
+      port: (outerServer.address() as net.AddressInfo).port,
+      host: "127.0.0.1",
+      ...clientTLS,
+    });
     try {
-      socket.on("error", () => {});
-      await Promise.race([once(socket, "connect"), failure]);
-      let backpressure = false;
-      for (let i = 0; i < 64 && !backpressure; i++) backpressure = !socket.write(Buffer.alloc(1024 * 1024, 0x61));
-      const rssBefore = process.memoryUsage.rss();
-      const tlsSocket = tls.connect({ socket, ...clientTLS });
-      tlsSocket.on("error", () => {});
-      const peer = await Promise.race([peerSide, failure]);
-      const deadline = Date.now() + 1500;
-      while (peer.writableLength > 0 && Date.now() < deadline) {
-        tlsSocket.read(0); // a reader poking the TLS socket must not lift the hold's read cap
-        await new Promise<void>(r => setTimeout(r, 20));
-      }
-      expect({
-        backpressure,
-        peerStillQueued: peer.writableLength > 0,
-        rssBounded: process.memoryUsage.rss() - rssBefore < FLOOD / 2,
-      }).toEqual({ backpressure: true, peerStillQueued: true, rssBounded: true });
-      peer.destroy();
+      outer.on("error", reject);
+      await Promise.race([once(outer, "secureConnect"), failure]);
+      expect(await Promise.race([pingOverTLS(outer, reject), failure])).toBe("ping");
     } finally {
-      socket.destroy();
+      outer.destroy();
+      outerServer.close();
     }
   },
 );

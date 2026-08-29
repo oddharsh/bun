@@ -906,7 +906,9 @@ if (cluster.isPrimary) {
       const secure = new tls.TLSSocket(plain, { isServer: true, key, cert });
       let emitted = 0;
       plain.on("data", chunk => (emitted += chunk.length));
-      secure.on("data", d => {
+      plain.on("error", e => process.send({ error: "plain: " + e.message }));
+      secure.on("error", e => process.send({ error: "secure: " + e.message }));
+      secure.once("data", d => {
         secure.end("echo:" + d);
         process.send({ emitted, buffered: plain.readableLength });
       });

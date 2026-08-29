@@ -1906,14 +1906,11 @@ function tieToWrappedStream(self, connection) {
   });
 }
 
-// Hands `connection`'s fd to a native TLS socket that becomes `self._handle`;
-// `connection` keeps its handle for close/destroy/address but sees no more
-// bytes (node's `_parentWrap`). What it had already pulled off the wire goes
-// with it: https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L502-L519
-// Plaintext it still has queued goes out before any TLS record: the handshake
-// is held until an empty write queued behind it completes, as in
-// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L579-L613
-// Returns false if `self` had to be destroyed instead.
+// `connection`'s fd goes to a native TLS socket that becomes `self._handle`;
+// `connection` keeps its handle (node's `_parentWrap`) but sees no more bytes.
+// Already-buffered bytes go along (node's initRead); still-queued plaintext
+// goes out before any TLS record (node's wrapHasActiveWriteFromPrevOwner):
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L502-L613
 function adoptConnection(self, connection, data, handlers, isServer, tls) {
   let pending: Buffer | undefined;
   if (connection.readableLength) {
@@ -2110,8 +2107,9 @@ Socket.prototype.connect = function connect(...args) {
           // No fd to adopt until the socket is established
           // (e.g. tls.connect({ socket: net.connect(port) })).
           connection.once("connect", () => {
-            if (this.destroyed) {
-              connection.destroy();
+            if (this.destroyed || connection.destroyed || !connection._handle) {
+              if (!connection.destroyed) connection.destroy();
+              if (!this.destroyed) this.destroy();
               return;
             }
             upgradeClientConnection(this, connection, isNamedPipeSocket(connection._handle), tls);

@@ -2026,8 +2026,13 @@ struct us_socket_t *us_internal_ssl_close(struct us_socket_t *s, int code, void 
    * ciphertext already reported as written: SSL sealed it, so it can only be
    * delivered, never re-sent. Mirror ssl_shutdown_after_spill; defer at most once. */
   if ((code == LIBUS_SOCKET_CLOSE_CODE_FAST_SHUTDOWN || code == LIBUS_SOCKET_CLOSE_CODE_CLEAN_SHUTDOWN)
-      && !reason
-      && !s->ssl_close_after_spill && !s->ssl_fatal_error && !us_socket_is_closed(s)) {
+      && !reason && !s->ssl_fatal_error && !us_socket_is_closed(s)) {
+    /* A second graceful close while the first waits for the spill (both halves
+     * of an upgradeTLS pair close the shared socket): the pending one finishes
+     * the job once the spill has drained. */
+    if (s->ssl_close_after_spill) {
+      return s;
+    }
     struct loop_ssl_data *loop_ssl_data = (struct loop_ssl_data *)s->group->loop->data.ssl_data;
     if (loop_ssl_data && !ssl_drain_spill(loop_ssl_data, s)) {
       s->ssl_close_after_spill = 1;

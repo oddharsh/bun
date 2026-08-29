@@ -890,12 +890,9 @@ TLSSocket.prototype._final = function _final(callback) {
   // tls.connect()). Node's native TLSWrap.DoShutdown likewise flushes the
   // handshake output before the underlying stream's FIN.
   // https://github.com/nodejs/node/blob/614050b657e9757c1097aa85f92f2cb51149dc0d/src/crypto/crypto_tls.cc#L1203
-  // A never-connected TLSSocket (e.g. new tls.TLSSocket().end(cb)) has no handle
-  // and no handshake to wait for; finish immediately like NetSocket._final's
-  // no-handle fast path, otherwise the deferred callback would never fire. One
-  // wrapping a live net.Socket gets its handle a moment later (on 'connect',
-  // or the server-side wrap's next tick), so it waits like the handshaking
-  // case below; if that socket dies first this one is destroyed with it.
+  // No handle: a never-connected TLSSocket (new tls.TLSSocket().end(cb)) has
+  // nothing to wait for; one wrapping a live net.Socket gets its handle shortly
+  // ('connect' / next tick) and waits like the handshaking case.
   if (!this._handle && !(this._parent && !this._parent.destroyed && this.secureConnecting)) return callback();
   if (this.secureConnecting) {
     // kSecureConnectDone rather than 'secureConnect': server-side sockets

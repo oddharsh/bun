@@ -4864,6 +4864,25 @@ pub fn js_upgrade_duplex_to_tls(
         twin: JsCell::new(None),
         verify_error: JsCell::new(None),
     });
+    // A handle-backed transport hands its bytes to the engine below JS.
+    let feed = || NativeCallbacks::TlsTransport(RefPtr::from_this(tls));
+    let linked = if let Some(t) = transport.as_class_ref::<TCPSocket>() {
+        t.attach_native_callback(feed())
+            .then(|| Transport::Tcp(t.ref_guard()))
+    } else if let Some(t) = transport.as_class_ref::<TLSSocket>() {
+        t.attach_native_callback(feed())
+            .then(|| Transport::Tls(t.ref_guard()))
+    } else {
+        None
+    };
+    if !transport.is_undefined() && linked.is_none() {
+        // Its reads already go somewhere else (an HTTP/2 session, another TLS
+        // layer); `data` events would never come either. Sole owner so far.
+        tls.get().deref();
+        return Err(global.throw(format_args!(
+            "This socket is already consumed by another native reader"
+        )));
+    }
     let tls_ref = tls;
     let tls_js_value = tls_ref.get_this_value(global);
     TLSSocket::data_set_cached(tls_js_value, global, default_data);
@@ -4986,24 +5005,6 @@ pub fn js_upgrade_duplex_to_tls(
     .register();
     DuplexUpgradeContext::start_tls(duplex_context_ref);
 
-    // A handle-backed transport hands its bytes to the engine below JS.
-    let feed = || NativeCallbacks::TlsTransport(RefPtr::from_this(tls));
-    let linked = if let Some(t) = transport.as_class_ref::<TCPSocket>() {
-        t.attach_native_callback(feed())
-            .then(|| Transport::Tcp(t.ref_guard()))
-    } else if let Some(t) = transport.as_class_ref::<TLSSocket>() {
-        t.attach_native_callback(feed())
-            .then(|| Transport::Tls(t.ref_guard()))
-    } else {
-        None
-    };
-    if !transport.is_undefined() && linked.is_none() {
-        // Its reads already go somewhere else (an HTTP/2 session, another TLS
-        // layer); `data` events would never come either.
-        return Err(global.throw(format_args!(
-            "This socket is already consumed by another native reader"
-        )));
-    }
     duplex_context_ref
         .upgrade
         .transport

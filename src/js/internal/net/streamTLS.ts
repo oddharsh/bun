@@ -1,12 +1,8 @@
-// The stream-level TLS engine (upgradeDuplexToTLS) over an existing stream:
-// generic Duplexes, named pipes, TLS over TLS, Http2SecureServer's injected
-// connections. A handle-backed net.Socket is read natively (nothing reaches
-// its own listeners, as under node's TLSWrap) and only what it had already
-// buffered is handed over here, a tick later like node's initRead; any other
-// Duplex is driven from its events like node's JSStreamSocket — the same split
-// as https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L566-L579.
-// Returns [nativeTLSHandle, events] (events[0..3]: the engine's
-// data/end/drain/close intake; attached as listeners only for a Duplex).
+// The stream-level TLS engine (upgradeDuplexToTLS) over an existing stream. A
+// handle-backed net.Socket is read natively (like under node's TLSWrap) and
+// hands over only what it had already buffered; any other Duplex is driven
+// from its events (node's JSStreamSocket). Same split as
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L566-L579.
 const upgradeDuplexToTLS = $newRustFunction("runtime/socket/socket.rs", "jsUpgradeDuplexToTLS", 2);
 
 function upgradeStreamToTLS(owner: { destroyed: boolean }, connection, options) {
@@ -15,7 +11,10 @@ function upgradeStreamToTLS(owner: { destroyed: boolean }, connection, options) 
   options.transport = transport;
   const [handle, events] = upgradeDuplexToTLS(connection, options);
   if (transport) {
-    // An EOF already taken off the wire is stream state now; a later one arrives natively.
+    // What it already buffered waits for feedBuffered rather than flow() to
+    // nobody; an EOF already taken off the wire is stream state now (a later
+    // one arrives natively).
+    connection.pause();
     const ended = connection._readableState?.ended;
     process.nextTick(feedBuffered, owner, connection, events[0], ended ? events[1] : undefined);
   } else {
